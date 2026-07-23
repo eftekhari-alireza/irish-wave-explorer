@@ -31,8 +31,9 @@ streamlit run app.py          # opens at http://localhost:8501
 ```
 
 The baked data ships with the repo — nothing to regenerate. Map clicks
-use Streamlit's native `st.plotly_chart(on_select=...)` (Streamlit ≥
-1.35); there are no third-party components.
+use `streamlit-plotly-events` (the same proven pattern as the
+shannon-tidal-explorer); without it the app still runs, you just type
+(i, j) instead of clicking.
 
 ## What's in Tier 1
 
@@ -193,22 +194,19 @@ All data files are < 100 MB, so plain Git is fine (no LFS needed).
   ~0.2 % tail of CI cells over-extrapolates from noisy Gumbel fits. The
   stored `rp_hs`/`gumbel_*` values are honest statistics; never alter
   them, and keep the short-record caveat on the Extremes tab.
-- **Map clicks are native and fragment-scoped**: `render_map` uses
-  `st.plotly_chart(on_select="rerun")` — never reintroduce
-  `streamlit-plotly-events` (unmaintained, unreliable) or a full-app
-  rerun on click. A click updates only its own tab; other tabs read the
-  new inspect cell on their next rerun. The per-key `_sel_*` markers
-  dedup Streamlit's re-delivery of old selections — keep them.
-- **Clicks are captured by the invisible Scattergl overlay**
-  (`add_click_layer`), NOT the heatmap — Heatmap traces never emit point
-  selections, so removing the overlay silently kills clicking again. The
-  overlay is wet-cells-only at display stride, carries the exact full-res
-  `(i, j)` in `customdata`, and uses alpha-0.01 markers (fully
-  transparent `rgba(0,0,0,0)` is skipped by hit testing in some Plotly
-  builds — don't "clean" that up).
-- The "use best cell" button still routes through `_pending_inspect` +
-  `full_rerun()`: it can fire during a full run (after the inspector
-  widgets are instantiated), so a direct write would raise. Leave it.
+- **Map clicks use `streamlit-plotly-events`** (`render_map`) — the same
+  pattern as the deployed shannon-tidal-explorer: `plotly_events(fig,
+  click_event=True, ...)` on the heatmap itself, then argmin the
+  returned lon/lat onto the axes and rerun. Do NOT switch to
+  `st.plotly_chart(on_select=...)` — Heatmap traces never emit native
+  point selections, so that path silently captures nothing (tried,
+  reverted). The component keys are per-map AND per-domain.
+- **All inspect-cell writes route through `_pending_inspect`** (applied
+  at the top of the script): map clicks and the "use best cell" button
+  can fire after the inspector's number_inputs are instantiated (the
+  Extremes map renders after them; plotly_events re-delivers its last
+  click on later full runs), and a direct session write there raises
+  Streamlit's modified-after-instantiation error. Leave the queue in.
 - Heavy per-rerun work is cached — `export_csv` (sidebar CSV bytes),
   `top_sites`, `storm_stats`, `rp_level_map`, and the two Energy figure
   builders. If you add a table/CSV/figure that's rebuilt from the big

@@ -34,10 +34,15 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# Map clicks use Streamlit's NATIVE plotly selection API
-# (st.plotly_chart(on_select="rerun"), Streamlit >= 1.35) — the old
-# streamlit-plotly-events iframe component was unreliable with large
-# heatmaps and forced full-app reruns; it has been removed.
+# Map clicks use streamlit-plotly-events — the same pattern as the
+# deployed-and-working shannon-tidal-explorer (click the heatmap
+# directly; plotly_events returns the clicked x/y in data space).
+# If not installed, the app falls back to typed (i, j) input only.
+try:
+    from streamlit_plotly_events import plotly_events
+    HAS_PLOTLY_EVENTS = True
+except ImportError:
+    HAS_PLOTLY_EVENTS = False
 
 # --------------------------------------------------------------------------
 # PATHS
@@ -195,11 +200,10 @@ def dstride(domain):
 
 
 def full_rerun():
-    """Rerun the WHOLE app from inside a fragment. Used ONLY by the
-    Site-Tools 'use best cell' button (rare, explicit action) via the
-    _pending_inspect queue. Map clicks and typed (i, j) changes stay
-    fragment-scoped on purpose — other tabs pick the new cell up on
-    their next rerun. Don't reintroduce full reruns on click paths."""
+    """Rerun the WHOLE app from inside a fragment (st.rerun's default
+    scope is already "app"; the try/except covers pre-scope Streamlit).
+    Used by the Site-Tools 'use best cell' button. Map clicks call plain
+    st.rerun() in render_map — same effect."""
     try:
         st.rerun(scope="app")
     except TypeError:           # older Streamlit: no scope kw, no fragments
@@ -979,53 +983,11 @@ def add_inspect_marker(fig):
         mode="markers",
         marker=dict(symbol="x", size=13, color="white",
                     line=dict(width=2.5, color="black")),
-        # Never dim, even while a click-selection is active elsewhere —
-        # plotly fades "unselected" scatter points by default.
-        selected=dict(marker=dict(opacity=1)),
-        unselected=dict(marker=dict(opacity=1)),
         showlegend=False,
         hovertemplate=(
             f"Inspect cell (i={ii}, j={jj})<br>"
             f"{fmt_loc(LON_AXIS[jj], LAT_AXIS[ii])}<extra></extra>"
         ),
-    ))
-
-
-@st.cache_data(show_spinner=False)
-def click_layer_xy(domain):
-    """Cell-centre points for the invisible click overlay, at DISPLAY
-    (strided) resolution, wet cells only — clicking land does nothing.
-    customdata carries the FULL-RES (i, j) so the inspector always lands
-    on a real grid cell; coordinates are rounded to shorten the JSON
-    (0.0001° ≈ 11 m, far below cell size — precision comes from
-    customdata, not the point position)."""
-    lon_ax, lat_ax = axes_1d(domain)
-    s = dstride(domain)
-    ii = np.arange(0, lat_ax.size, s)
-    jj = np.arange(0, lon_ax.size, s)
-    J, I = np.meshgrid(jj, ii)
-    I, J = I.ravel(), J.ravel()
-    wet = wet_mask(domain)[I, J]
-    I, J = I[wet], J[wet]
-    x = np.round(lon_ax[J], 4)
-    y = np.round(lat_ax[I], 4)
-    cd = np.stack([I, J], axis=1).astype(np.int32)
-    return x, y, cd
-
-
-def add_click_layer(fig, domain):
-    """Invisible-but-hit-testable Scattergl overlay — Streamlit's
-    on_select never fires 'points' for a Heatmap trace, so this layer is
-    what actually captures map clicks. alpha-0.01 markers (not fully
-    transparent: some Plotly builds skip rgba(0,0,0,0) in hit testing)."""
-    x, y, cd = click_layer_xy(domain)
-    fig.add_trace(go.Scattergl(
-        x=x, y=y, customdata=cd,
-        mode="markers",
-        marker=dict(size=14, color="rgba(0,0,0,0.01)"),
-        selected=dict(marker=dict(opacity=0)),
-        unselected=dict(marker=dict(opacity=0)),
-        hoverinfo="skip", showlegend=False, name="",
     ))
 
 
@@ -1042,56 +1004,47 @@ def standard_colorbar():
 
 
 def render_map(fig, key):
-    """Clickable map via Streamlit's native plotly selection API.
+    """Clickable map — the shannon-tidal-explorer pattern (proven on
+    Streamlit Cloud): click the heatmap directly via plotly_events, map
+    the returned data-space x/y (lon/lat here) to the nearest cell with
+    argmin on the axes, set the inspect cell, rerun.
 
-    The chart lives inside a tab fragment, so on_select="rerun" reruns
-    ONLY that fragment — a click updates the current tab in place instead
-    of rebuilding all eight (the old streamlit-plotly-events + full-rerun
-    path is what made the map unusable). Other tabs pick the new cell up
-    from session_state on their next rerun.
+    The widget key is per-map AND per-domain: two clickable maps can be
+    on screen at once (Energy + Extremes), and a domain switch must not
+    inherit the other domain's last click.
 
-    Two guards:
-    - the widget key includes the domain, so selection state cannot leak
-      across a CI <-> GB switch;
-    - a per-key marker dedups Streamlit's re-delivery of the SAME
-      selection on later reruns — without it, a stale click would clobber
-      a newer typed (i, j).
-
-    The inspect write is direct (no _pending_inspect queue): the map
-    always renders BEFORE the (i, j) number_inputs of its own fragment,
-    and other fragments' widgets are not instantiated during this
-    fragment's rerun.
-
-    CRITICAL: Heatmap traces never emit point selections — the clicks
-    are captured by the invisible Scattergl overlay (add_click_layer),
-    and the cell comes from the point's customdata = (i, j), not from
-    x/y coordinate guessing.
+    The write goes through the tiny _pending_inspect queue (applied at
+    the top of the next run) rather than a direct session write: the
+    Extremes map renders AFTER the Energy inspector's number_inputs, and
+    plotly_events re-delivers its last click on later full runs — a
+    direct write there would raise Streamlit's modified-after-
+    instantiation error. Behaviour is identical to set-state + rerun.
     """
     add_inspect_marker(fig)
-    add_click_layer(fig, domain)
-    wkey = f"{key}_{domain}"
-    event = st.plotly_chart(
-        fig, key=wkey, on_select="rerun", selection_mode="points",
-        use_container_width=True, config=PLOTLY_CONFIG,
-    )
-    pts = None
-    if event is not None:
-        sel = getattr(event, "selection", None)
-        if sel:
-            pts = sel.get("points") or None
-    if pts:
-        cd = pts[0].get("customdata")
-        if cd is not None and len(cd) == 2:
-            new_i, new_j = int(cd[0]), int(cd[1])
-            marker = (new_i, new_j)
-            if st.session_state.get(f"_sel_{wkey}") != marker:
-                st.session_state[f"_sel_{wkey}"] = marker
+    if HAS_PLOTLY_EVENTS:
+        selected = plotly_events(
+            fig, click_event=True, hover_event=False, select_event=False,
+            override_height=FIG_HEIGHT + 10,
+            key=f"map_click_{key}_{domain}",
+        )
+        if selected:
+            pt = selected[0]
+            try:
+                x, y = float(pt["x"]), float(pt["y"])
+                new_j = int(np.argmin(np.abs(LON_AXIS - x)))
+                new_i = int(np.argmin(np.abs(LAT_AXIS - y)))
                 if (new_i, new_j) != (int(st.session_state["inspect_i"]),
                                       int(st.session_state["inspect_j"])):
-                    st.session_state["inspect_i"] = new_i
-                    st.session_state["inspect_j"] = new_j
-    st.caption("💡 Click any cell to load it into the Cell inspector "
-               "below. Use the camera button to save a PNG.")
+                    st.session_state["_pending_inspect"] = (new_i, new_j)
+                    st.rerun()
+            except (TypeError, ValueError, KeyError):
+                pass
+        st.caption("💡 Click any cell to load it into the Cell inspector "
+                   "below.")
+    else:
+        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+        st.caption("💡 Tip: `pip install streamlit-plotly-events` to enable "
+                   "click-to-inspect. Use the camera button to save a PNG.")
 
 
 # --------------------------------------------------------------------------
