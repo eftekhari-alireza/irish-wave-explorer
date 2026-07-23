@@ -1,0 +1,162 @@
+# Irish Wave-Energy Resource Explorer
+
+A self-contained Streamlit web app that turns a 12-year SWAN wave-model
+hindcast of Ireland (2004–2015) into an interactive map of the
+**wave-energy resource for 18 real wave-energy converters (WECs)**, at two
+nested spatial scales:
+
+- **CI** — all-Ireland / NE-Atlantic (~5 km cells, hourly)
+- **GB** — Galway Bay (~200 m cells, 30-min), nested inside CI
+
+For every wet grid cell, the annual energy production (AEP, MWh/yr) and
+capacity factor (CF, %) of all 18 devices are precomputed with two methods
+(`interp` bilinear / `bin` occurrence-table) and baked into `data/`. The
+app is a pure visualisation layer — no analysis logic of its own.
+
+Sibling app, same house style: the
+[Shannon Tidal Resource Explorer](https://shannon-tidal-explorer.streamlit.app/)
+(DIVAST tidal analogue).
+
+---
+
+## Quick start
+
+Python 3.10+:
+
+```bash
+git clone <this-repo>
+cd irish-wave-explorer
+pip install -r requirements.txt
+streamlit run app.py          # opens at http://localhost:8501
+```
+
+The baked data (~73 MB) ships with the repo — nothing to regenerate. If
+`streamlit-plotly-events` is missing the app still works; you just type
+(i, j) instead of clicking the map.
+
+## What's in Tier 1
+
+- **Domain toggle** CI ↔ GB, with the GB extent drawn as a red box on the
+  CI map
+- **Resource map** — pick any of the 18 WECs, show CF or AEP; KPI cards for
+  domain-mean CF, best cell (+ location), mean AEP
+- **Best device per cell (the hero)** — every cell coloured by *which* WEC
+  wins there, with a wins bar chart. Flip the metric to watch small
+  high-CF devices (Oyster, WaveStar) hand over to the big machines (SSG)
+  on AEP
+- **Method toggle** `interp` ↔ `bin` (both precomputed; they agree to
+  ~0.1 % CF)
+- **Cell inspector** — click any cell → all 18 devices ranked there by
+  CF/AEP, with best-by-CF / best-by-AEP callouts
+- **Compare two devices** — side-by-side (shared colour scale) or an
+  A − B difference map (diverging, centred on zero)
+- **Device leaderboard** — sortable domain-wide table: mean/max CF, mean/
+  total AEP, cells won
+- **Power matrix viewer** — the selected device's published matrix as a
+  heatmap
+- **Export** — CSV of the visible cells; PNG via the map's camera button;
+  **URL state** (every control is encoded in the page URL — copy to share)
+- **Methodology tab** — model setup, device sources, AEP/CF method,
+  validation, caveats
+
+Deliberately **not** built: LCOE / cost features (deferred by design).
+
+## What's in Tier 2 (this version)
+
+- **🌍 Climate Atlas tab** — seven views over the hindcast, respecting the
+  CI/GB domain toggle:
+  - *Long-term mean* — Hs, Te, Tp, direction (cyclic scale), wave power
+    (deep-water P = 0.49·Hs²·Te)
+  - *Seasonal* — annual/DJF/MAM/JJA/SON Hs or wave power, one shared
+    colour scale so winter-vs-summer contrast is visible; winter/summer
+    ratio KPI
+  - *Interannual* — year slider 2004–2015 with auto-labelled stormiest
+    (2014) and calmest years, anomaly vs the 12-yr mean
+  - *Operability* — % of time Hs < 1.5 / 2.0 / 2.5 m (weather windows)
+  - *Extremes* — 12-yr max Hs, fixed 0–18 m scale (QC-capped; see
+    Methodology)
+  - *Variability* — interannual σ of yearly-mean Hs
+  - *Animated loops* — seasonal-cycle and 2004→2015 Plotly frame
+    animations with play/pause + scrubber
+- **⛈️ Storm Replay tab (the hero)** — 144 hourly Hs frames for the
+  December 2013 and January 2014 storms (CI grid): play/pause, timeline
+  scrubber with midnight ticks, live timestamp + frame-max readout,
+  starts on the peak frame. Opt-in load (the player is a ~10 MB
+  in-browser payload). Plus a full-resolution single-hour viewer with
+  wave-direction arrows
+- **Depth-deployability filter (GB)** — sidebar mask from the GB
+  bathymetry (0.5–108 m): per-device operating-depth bands (first-pass
+  heuristics from the device class) or a custom range; maps, KPIs and
+  CSV export all honour it; the cell inspector shows water depth. GB
+  only (no all-Ireland bathymetry yet)
+
+Still deferred: wave rose / Hs–Te scatter (needs per-cell occurrence
+data), animated direction particles, CI bathymetry (GEBCO), LCOE.
+
+## Data layer
+
+```
+data/
+├── resource_CI.parquet    30 MB — 1,803,240 rows
+├── resource_GB.parquet    46 MB — 2,801,556 rows
+├── resource_CI_grid.npz   Xp/Yp lon-lat grids (181 × 341)
+├── resource_GB_grid.npz   Xp/Yp lon-lat grids (309 × 485)
+├── devices.json           18 WEC power matrices + metadata
+├── atlas_CI.npz           climate-atlas layers, CI (means/seasonal/
+├── atlas_GB.npz           per-year/operability/extremes/variability)
+├── storm_dec2013.npz      144 hourly Hs+dir frames, CI grid
+├── storm_jan2014.npz      144 hourly Hs+dir frames, CI grid
+└── depth_GB.npz           GB bathymetry (0.5–108 m, cube-aligned)
+```
+
+Parquet schema — one row per (cell, device, method), wet cells only:
+
+| column | meaning |
+|---|---|
+| `i`, `j` | grid indices into `Xp`/`Yp` |
+| `lon`, `lat` | cell centre |
+| `device` | one of 18 WEC names |
+| `rated_kW` | rated power |
+| `period_type` | `Te` / `Tp` / `Tz` — which period the matrix uses |
+| `method` | `interp` or `bin` |
+| `aep_MWh`, `cf_pct` | the resource numbers |
+
+The cube was generated by `grid_resource.py` (parent SWAN workspace) from
+the raw SWAN spatial output; device matrices come from Majidi et al.
+(2025) and are verified 18/18 against the published figures
+(`verify_devices.py`).
+
+## Deployment
+
+Mirror of the shannon-tidal-explorer chain:
+
+1. Push this folder to a GitHub repo (`main` branch)
+2. On [share.streamlit.io](https://share.streamlit.io) → New app → point it
+   at the repo, `app.py`
+3. Every later `git push origin main` auto-redeploys in ~2 min
+
+All data files are < 100 MB, so plain Git is fine (no LFS needed).
+
+## Versioning notes
+
+- **Plotly pinned `<6`** — same reason as the sibling app: Plotly 6 changed
+  its JSON schema and older Streamlit renders nothing.
+- The colorbar deliberately has **no title** (field name lives in the
+  subheader) — a titled colorbar shifts the plot area between fields.
+- Map axes have **fixed ranges** per domain — switching devices/metrics
+  never re-crops the map.
+- The storm player is **opt-in by checkbox**: Streamlit re-renders every
+  tab on each interaction, so an always-on 144-frame figure would re-ship
+  ~10 MB on every click anywhere in the app. Don't remove the gate.
+- The animation figures are built inside `st.cache_resource` functions —
+  frame stacks are rounded to 1–2 decimals (float64) before plotting to
+  keep the JSON payload compact. Keep that rounding.
+- The **max-Hs layer is QC-capped at 18 m** (removal of ~0.001 % numerical
+  spikes; 137 CI cells + 1 GB cell set to NaN). Means, seasonal, per-year
+  and operability layers are untouched. Don't "fix" this.
+
+---
+
+*Science & data: Alireza Eftekhari — University of Galway (supervisor
+Dr Stephen Nash). Device power matrices: Majidi et al. (2025), "Power
+production assessment of wave energy converters in mainland Portugal".*

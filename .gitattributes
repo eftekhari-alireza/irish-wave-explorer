@@ -1,0 +1,3 @@
+# Treat baked data as binary — no diffs, no EOL conversion
+*.parquet binary
+*.npz binary
