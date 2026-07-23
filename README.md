@@ -6,7 +6,7 @@ on Community Cloud — see `FABLE_SPLIT`):
 | Entry file | App | Loads |
 |---|---|---|
 | `energy_app.py` | ⚡ Energy Resource — AEP/CF maps, best-device, compare, Devices, Site Tools; carries the map click | resource parquets, devices.json, depth_GB |
-| `atlas_app.py` | 🌍 Climate Atlas — means/seasonal/interannual/operability, Storm Replay, Wave Rose, Extremes | atlas/storm/rose/extremes npz only |
+| `atlas_app.py` | 🌍 Climate Atlas — means/seasonal/interannual/operability, storm hour-viewer, Wave Rose, Extremes. **VIEW-ONLY: no plotly_events / clickable maps** (they caused a rerun loop here); per-cell views use typed (i, j) pickers, and the Extremes map hover shows each cell's (i, j) | atlas/storm/rose/extremes npz only |
 
 Shared: `common.py` (constants, grid geometry from the tiny grid npz —
 wet mask = `count > 0`, verified identical to the parquet's wet cells —
@@ -195,12 +195,16 @@ All data files are < 100 MB, so plain Git is fine (no LFS needed).
   heatmaps; CI full-res) and the distribution strip is pre-binned
   server-side. KPIs, the inspector and CSV exports always use the full
   grids — only what goes into `go.Heatmap` is thinned.
-- The storm player AND the hour viewer are **opt-in by checkbox** —
-  never a collapsed `st.expander`, whose contents Streamlit still
-  executes and ships on every render. Storm KPIs come from
-  `storm_meta()` (lazy npz member reads); `load_storm()`/`storm_stats()`
-  (47 MB) run only when a checkbox is ticked. The viewer's heatmaps are
-  display-strided 2×. Don't "simplify" any of this back.
+- **The Climate app is view-only** — no `plotly_events`, no
+  `common.render_map`, no 144-frame animated player (all removed after
+  freeze diagnoses). The storm is a checkbox-gated static hour slider
+  (one strided frame per render); per-cell rose/extremes use typed
+  (i, j) inputs (rose: `inspect_i/j`, extremes: `ext_i/ext_j` — distinct
+  keys so both fragments can instantiate widgets in one run). Storm KPIs
+  come from `storm_meta()` (lazy npz member reads); `load_storm()`
+  (47 MB) runs only when the viewer is ticked. Heavy content must never
+  sit in a collapsed `st.expander` (contents execute anyway). The map
+  click lives in the ENERGY app only.
 - The animation figures are built inside `st.cache_resource` functions —
   frame stacks are rounded to 1–2 decimals (float64) before plotting to
   keep the JSON payload compact. Keep that rounding.

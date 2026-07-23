@@ -27,9 +27,15 @@ import streamlit as st
 import common as C
 from common import (
     DATA_DIR, FIG_HEIGHT, RIGHT_MARGIN, LAND_COLOR, SEA_COLOR, fmt_loc,
-    fragment, dstride, cstride, apply_pending_inspect, base_fig,
-    add_gb_box, standard_colorbar, render_map, plotly_config,
+    fragment, dstride, base_fig, add_gb_box, standard_colorbar,
+    plotly_config,
 )
+
+# VIEW-ONLY app: no plotly_events / common.render_map anywhere here — the
+# interactive-map component caused a rerun loop that froze this app, and
+# the Climate app's job is to SHOW the wave climate. Per-cell views (rose,
+# return curve) are driven by typed (i, j) inputs instead. The click stays
+# in the Energy app only.
 
 # --------------------------------------------------------------------------
 # PAGE CONFIG
@@ -250,33 +256,10 @@ def _anim_axes(fig, Xp, Yp):
                      ticksuffix="°", tickfont=dict(size=9))
 
 
-@st.cache_resource(show_spinner="Building storm animation…")
-def storm_figure(label, spatial_stride=2):
-    S = load_storm(label)
-    hs = S["hs"][:, ::spatial_stride, ::spatial_stride]
-    Xp = S["Xp"].astype(float)[::spatial_stride, ::spatial_stride]
-    Yp = S["Yp"].astype(float)[::spatial_stride, ::spatial_stride]
-    z = np.round(hs.astype(np.float64), 1)
-    land = np.where(np.isnan(hs[0]), 1.0, np.nan)
-    vmax = float(np.ceil(np.nanmax(hs)))
-
-    hours = S["hours"].astype(int)
-    mon = {12: "Dec", 1: "Jan"}.get(int(S["month"]), str(int(S["month"])))
-    year = int(S["year"])
-    days, hh = hours // 24 + 1, hours % 24
-    stamps = [f"{d} {mon} {year}, {h:02d}:00" for d, h in zip(days, hh)]
-    fmax = np.nanmax(hs, axis=(1, 2))
-    annos = [f"<b>{stamps[t]}</b>  ·  max Hs {fmax[t]:.1f} m"
-             for t in range(len(z))]
-    slider_labels = [f"{d} {mon}" if h == 0 else " "
-                     for d, h in zip(days, hh)]
-
-    fig = make_frame_animation(
-        z, slider_labels, Xp[0, :], Yp[:, 0], land, "Turbo",
-        0.0, vmax, "m", int(S["peak"]), 120, ":.1f", annos,
-    )
-    _anim_axes(fig, Xp, Yp)
-    return fig
+# (The 144-frame animated storm player was removed — Climate app is
+# view-only; the storm is now a static one-frame-at-a-time hour slider.
+# make_frame_animation/_anim_axes stay: the atlas Animated-loops view
+# still uses them.)
 
 
 @st.cache_resource(show_spinner="Building loop animation…")
@@ -560,23 +543,18 @@ def render_storm():
     def _stamp(t):
         return f"{hours[t] // 24 + 1} {mon} {syear}, {hours[t] % 24:02d}:00"
 
-    st.subheader(f"Storm replay — hourly Hs, {storm_choice}")
-    show_player = st.checkbox(
-        f"▶ Load the {storm_choice} player (144 hourly frames)",
-        value=False, key=f"storm_player_{label}",
-        help="Builds the in-browser animation (~10 MB). Once loaded it "
-             "stays on for the session; untick to lighten the app again.",
-    )
+    st.subheader(f"Storm — hour-by-hour Hs, {storm_choice}")
     show_viewer = st.checkbox(
-        "🔎 Show the hour viewer (+ direction arrows)",
+        f"🌊 Load the {storm_choice} storm (hour-by-hour viewer)",
         value=False, key=f"storm_viewer_{label}",
-        help="Single-hour map with a scrub slider and wave-direction "
-             "arrows. Loads the storm frames on first use.",
+        help="Loads the storm frames (47 MB, once per session) and shows "
+             "one hour at a time via the slider — no client-side "
+             "animation, so it stays light.",
     )
-    loaded = show_player or show_viewer
+    loaded = show_viewer
 
     # KPIs — metadata is free; the Peak-Hs number needs the frame stack,
-    # so it appears once the player or viewer has loaded the storm.
+    # so it appears once the viewer has loaded the storm.
     k1, k2, k3, k4 = st.columns(4)
     if loaded:
         peak_hs, hs_ceil = storm_stats(label)
@@ -585,27 +563,18 @@ def render_storm():
                        "window.")
     else:
         k1.metric("Peak Hs", "—",
-                  help="Tick the player or the hour viewer to load the "
-                       "storm frames (47 MB) and show this.")
+                  help="Tick the viewer to load the storm frames (47 MB) "
+                       "and show this.")
     k2.metric("Peak hour", _stamp(peak))
     k3.metric("Window", f"{n_frames} h (6 days)",
               help="Hourly frames centred on the storm peak.")
     k4.metric("Grid", "All-Ireland (CI)",
-              help="Storm replay always uses the CI grid, independent of "
+              help="The storm frames are on the CI grid, independent of "
                    "the sidebar domain toggle.")
 
-    if show_player:
-        st.plotly_chart(storm_figure(label), use_container_width=True,
-                        config=PLOTLY_CONFIG)
-        st.caption(
-            "▶ Play sweeps one frame per hour; the slider scrubs (ticks "
-            "mark midnights). Starts on the peak frame; fixed colour "
-            "scale so the storm visibly builds and fades. Maps are "
-            "thinned 2× for speed."
-        )
     if not loaded:
         st.caption(
-            "Tick a box above to load the storm — nothing heavy is "
+            "Tick the box above to load the storm — nothing heavy is "
             "built until you do."
         )
 
@@ -662,9 +631,11 @@ def render_storm():
                     f"{float(np.nanmax(hs_t)):.1f} m")
         st.plotly_chart(sfig, use_container_width=True, config=PLOTLY_CONFIG)
         st.caption(
-            "Arrows point in the direction of wave travel (met-convention "
+            "Move the slider to step through the storm hour by hour — "
+            "each move renders one frame server-side (light). Arrows "
+            "point in the direction of wave travel (met-convention "
             "'coming-from' + 180°), thinned to every 10th cell. Display "
-            "thinned 2×; hover reads the strided cells. Source: "
+            "thinned 2×. Source: "
             f"`{meta['source']}`."
         )
 
@@ -675,7 +646,6 @@ def render_storm():
 # ==========================================================================
 @fragment
 def render_rose():
-    apply_pending_inspect()     # before this fragment's number_inputs
     if not has_rose(domain):
         st.info(f"`rose_{domain}.npz` is not in `data/` yet — run "
                 "`climate_extras.py` to generate it.")
@@ -689,7 +659,8 @@ def render_rose():
         "Rose for:", ["Domain-wide", "Inspected cell"],
         horizontal=True, key="rose_scope",
         help="Domain-wide = all wet cells pooled. Inspected cell = the "
-             "(i, j) below — also settable by clicking the Extremes map.",
+             "typed (i, j) below — read a cell's (i, j) off the Extremes "
+             "map hover, or use the clickable maps in the Energy app.",
     )
 
     hist = None
@@ -773,7 +744,15 @@ def render_rose():
 # ==========================================================================
 @fragment
 def render_extremes():
-    apply_pending_inspect()     # fragment-scoped click on the rp map
+    # Own typed (i, j) cell picker (keys ext_i/ext_j — distinct from the
+    # rose's inspect keys, so both fragments can instantiate widgets on
+    # the same run). Seed / domain-reset BEFORE the widgets are created.
+    if st.session_state.get("ext_domain") != domain:
+        _di, _dj = default_cell(domain)
+        st.session_state["ext_i"] = int(_di)
+        st.session_state["ext_j"] = int(_dj)
+        st.session_state["ext_domain"] = domain
+
     st.warning(EXTREME_CAVEAT)
     if not has_extremes(domain):
         st.info(f"`extremes_{domain}.npz` is not in `data/` yet — run "
@@ -808,34 +787,66 @@ def render_extremes():
                    "display cap — noisy fits, not physics.")
 
     st.subheader(f"{T_sel}-yr return-level Hs  ·  {DMETA['label']}")
-    _sr, _sc = cstride(domain)         # clickable map — extra-light
-    rp_fig = base_fig(stride=(_sr, _sc))
+    # STATIC map (view-only app — no plotly_events / click capture).
+    # Hover carries (i, j) so cells can be typed into the pickers here
+    # and in the Wave Rose tab.
+    _s = dstride(domain)
+    _II, _JJ = np.meshgrid(np.arange(0, NY, _s), np.arange(0, NX, _s),
+                           indexing="ij")
+    _cd = np.dstack([_II, _JJ]).astype(np.int32)
+    rp_fig = base_fig()
     rp_fig.add_trace(go.Heatmap(
-        z=Z_rp[::_sr, ::_sc], x=LON_AXIS[::_sc], y=LAT_AXIS[::_sr],
+        z=Z_rp[::_s, ::_s], x=LON_AXIS[::_s], y=LAT_AXIS[::_s],
         colorscale="Turbo",
         zmin=0.0, zmax=RP_CLIP_M,       # DISPLAY CLIP ONLY (per spec)
         hoverongaps=False, connectgaps=False, zsmooth=False,
+        customdata=_cd,
         colorbar=standard_colorbar(),
-        hovertemplate=("%{x:.3f}°, %{y:.3f}°<br>"
+        hovertemplate=("%{x:.3f}°, %{y:.3f}° · "
+                       "i=%{customdata[0]}, j=%{customdata[1]}<br>"
                        f"{T_sel}-yr Hs: %{{z:.1f}} m<extra></extra>"),
     ))
     add_gb_box(rp_fig)
-    render_map(rp_fig, key="map_extremes")
+    # × marker at the picked cell
+    _mi = int(st.session_state["ext_i"])
+    _mj = int(st.session_state["ext_j"])
+    rp_fig.add_trace(go.Scatter(
+        x=[LON_AXIS[_mj]], y=[LAT_AXIS[_mi]], mode="markers",
+        marker=dict(symbol="x", size=13, color="white",
+                    line=dict(width=2.5, color="black")),
+        showlegend=False,
+        hovertemplate=(f"Picked cell (i={_mi}, j={_mj})<br>"
+                       f"{fmt_loc(LON_AXIS[_mj], LAT_AXIS[_mi])}"
+                       "<extra></extra>"),
+    ))
+    st.plotly_chart(rp_fig, use_container_width=True, config=PLOTLY_CONFIG)
     st.caption(
         f"Colour scale clipped at {RP_CLIP_M:.0f} m **for display only** "
         "— a ~0.2 % tail of CI cells over-extrapolates to 20–29 m from "
         "noisy Gumbel fits; stored values are untouched (hover to read "
-        "them). Gumbel fit to the 12 annual maxima per cell. Clicking "
-        "sets the inspected cell (used by the Wave Rose and the detail "
-        "below)."
+        "them). Gumbel fit to the 12 annual maxima per cell. Hover shows "
+        "each cell's (i, j) — type them into the picker below for the "
+        "per-cell curve."
     )
 
     with st.expander(
         "📉 Cell detail — annual maxima & fitted return-level curve",
-        expanded=False,
+        expanded=True,
     ):
-        ii_e = int(st.session_state["inspect_i"])
-        jj_e = int(st.session_state["inspect_j"])
+        pc_a, pc_b, pc_c = st.columns([1, 1, 3])
+        with pc_a:
+            st.number_input("Row (i)", min_value=0, max_value=NY - 1,
+                            step=1, key="ext_i")
+        with pc_b:
+            st.number_input("Col (j)", min_value=0, max_value=NX - 1,
+                            step=1, key="ext_j")
+        with pc_c:
+            st.caption(
+                "Enter a cell's (i, j) — read them off the map hover "
+                "above. Default = the domain's highest-mean-Hs cell."
+            )
+        ii_e = int(st.session_state["ext_i"])
+        jj_e = int(st.session_state["ext_j"])
         am = E["annual_max"][:, ii_e, jj_e]
         loc_c = float(E["gumbel_loc"][ii_e, jj_e])
         sc_c = float(E["gumbel_scale"][ii_e, jj_e])
