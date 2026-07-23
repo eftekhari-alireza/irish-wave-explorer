@@ -1,6 +1,19 @@
 # Irish Wave-Energy Resource Explorer
 
-A self-contained Streamlit web app that turns a 12-year SWAN wave-model
+**TWO Streamlit apps from this one repo** (split for memory + rerun cost
+on Community Cloud — see `FABLE_SPLIT`):
+
+| Entry file | App | Loads |
+|---|---|---|
+| `energy_app.py` | ⚡ Energy Resource — AEP/CF maps, best-device, compare, Devices, Site Tools; carries the map click | resource parquets, devices.json, depth_GB |
+| `atlas_app.py` | 🌍 Climate Atlas — means/seasonal/interannual/operability, Storm Replay, Wave Rose, Extremes | atlas/storm/rose/extremes npz only |
+
+Shared: `common.py` (constants, grid geometry from the tiny grid npz —
+wet mask = `count > 0`, verified identical to the parquet's wet cells —
+domain toggle, fragment helpers, and the clickable-map machinery with the
+click de-dup). `app.py` is a pointer stub for the old single-app deploy.
+
+A self-contained toolset that turns a 12-year SWAN wave-model
 hindcast of Ireland (2004–2015) into an interactive map of the
 **wave-energy resource for 18 real wave-energy converters (WECs)**, at two
 nested spatial scales:
@@ -27,7 +40,8 @@ Python 3.10+:
 git clone <this-repo>
 cd irish-wave-explorer
 pip install -r requirements.txt
-streamlit run app.py          # opens at http://localhost:8501
+streamlit run energy_app.py    # ⚡ resource maps + site tools
+streamlit run atlas_app.py     # 🌍 climate atlas + storms + extremes
 ```
 
 The baked data ships with the repo — nothing to regenerate. Map clicks
@@ -194,13 +208,17 @@ All data files are < 100 MB, so plain Git is fine (no LFS needed).
   ~0.2 % tail of CI cells over-extrapolates from noisy Gumbel fits. The
   stored `rp_hs`/`gumbel_*` values are honest statistics; never alter
   them, and keep the short-record caveat on the Extremes tab.
-- **Map clicks use `streamlit-plotly-events`** (`render_map`) — the same
-  pattern as the deployed shannon-tidal-explorer: `plotly_events(fig,
+- **Map clicks use `streamlit-plotly-events`** (`common.render_map`) —
+  the shannon-tidal-explorer pattern: `plotly_events(fig,
   click_event=True, ...)` on the heatmap itself, then argmin the
-  returned lon/lat onto the axes and rerun. Do NOT switch to
+  returned lon/lat onto the axes. Do NOT switch to
   `st.plotly_chart(on_select=...)` — Heatmap traces never emit native
-  point selections, so that path silently captures nothing (tried,
-  reverted). The component keys are per-map AND per-domain.
+  point selections (tried, reverted). Keys are per-map AND per-domain.
+- **The `_lastclick_{key}_{domain}` de-dup is load-bearing**:
+  plotly_events re-delivers its stored last click on every rerun of the
+  component; without comparing against the last PROCESSED click, the
+  second click freezes (re-delivery loop) and stale clicks clobber typed
+  cells. Removing this guard was tried once — don't repeat it.
 - **All inspect-cell writes route through `_pending_inspect`**: map
   clicks and the "use best cell" button can fire after the inspector's
   number_inputs are instantiated, and a direct session write there
