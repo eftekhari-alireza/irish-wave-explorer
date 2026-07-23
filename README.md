@@ -90,8 +90,29 @@ Deliberately **not** built: LCOE / cost features (deferred by design).
   CSV export all honour it; the cell inspector shows water depth. GB
   only (no all-Ireland bathymetry yet)
 
-Still deferred: wave rose / Hs–Te scatter (needs per-cell occurrence
-data), animated direction particles, CI bathymetry (GEBCO), LCOE.
+## What's in Tier 3 (this version)
+
+- **🔧 Devices tab** — the 18-WEC library made visible: power-matrix
+  heatmap per device (Hs × period, zeros = the cut-in/cut-out envelope),
+  metadata cards, sortable 18-device summary table
+- **📍 Site Tools tab** —
+  - *Array / farm calculator*: device × inspected cell × N units → farm
+    AEP, CF, and homes powered (÷ 4.2 MWh/yr per household, SEAI), with a
+    "use best cell" jump and an array-size bar chart. Linear scaling, no
+    wake losses — labelled as such
+  - *Best-sites finder*: top-N cells by AEP/CF for the selected device,
+    depth-filter aware, CSV download
+- **🧭 Wave Rose tab** — stacked Barpolar of joint Hs × direction
+  occurrence (12 sectors × 7 bands), domain-wide or at the inspected
+  cell; met-convention "coming from", N at top. Dominant sector ≈ W
+- **📈 Extremes tab** — Hs return-level maps (Gumbel fit to the 12
+  annual maxima) for T = 2–100 yr plus a free-T option; click any cell
+  for its annual maxima + fitted curve at Weibull plotting positions.
+  Colour scale display-clipped at 20 m (stored values untouched); the
+  short-record caveat is pinned to the tab
+
+Still deferred: animated direction particles, CI bathymetry (GEBCO),
+LCOE.
 
 ## Data layer
 
@@ -106,7 +127,11 @@ data/
 ├── atlas_GB.npz           per-year/operability/extremes/variability)
 ├── storm_dec2013.npz      144 hourly Hs+dir frames, CI grid
 ├── storm_jan2014.npz      144 hourly Hs+dir frames, CI grid
-└── depth_GB.npz           GB bathymetry (0.5–108 m, cube-aligned)
+├── depth_GB.npz           GB bathymetry (0.5–108 m, cube-aligned)
+├── rose_CI.npz            per-cell Hs×direction histograms (7×12)
+├── rose_GB.npz            + domain-wide totals
+├── extremes_CI.npz        annual maxima + Gumbel fit + return-level
+└── extremes_GB.npz        maps (T = 2/5/10/25/50/100 yr)
 ```
 
 Parquet schema — one row per (cell, device, method), wet cells only:
@@ -154,6 +179,14 @@ All data files are < 100 MB, so plain Git is fine (no LFS needed).
 - The **max-Hs layer is QC-capped at 18 m** (removal of ~0.001 % numerical
   spikes; 137 CI cells + 1 GB cell set to NaN). Means, seasonal, per-year
   and operability layers are untouched. Don't "fix" this.
+- The **return-period map is colour-clipped at 20 m — display only**: a
+  ~0.2 % tail of CI cells over-extrapolates from noisy Gumbel fits. The
+  stored `rp_hs`/`gumbel_*` values are honest statistics; never alter
+  them, and keep the short-record caveat on the Extremes tab.
+- Inspect-cell changes from late-rendering widgets (Extremes map clicks,
+  the "use best cell" button) must go through the `_pending_inspect`
+  queue, never write `inspect_i`/`inspect_j` directly — Streamlit forbids
+  writing a widget's key after it is instantiated.
 
 ---
 

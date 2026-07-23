@@ -134,6 +134,20 @@ STORMS = {          # label -> npz suffix (both on the CI grid, 144 h hourly)
     "January 2014":  "jan2014",
 }
 
+# ---------------- Tier 3 constants ----------------
+HOMES_MWH_YR = 4.2      # average Irish household electricity use, MWh/yr (SEAI)
+RP_CLIP_M    = 20.0     # DISPLAY-ONLY colour cap for return-period maps
+EXTREME_CAVEAT = (
+    "⚠️ 12 years is a short record for a 50–100 yr extrapolation; these are "
+    "indicative design sea states with wide uncertainty, not a formal "
+    "extreme-value analysis."
+)
+ROSE_COLORS = [          # 7 Hs bands, calm -> severe (Spectral-reversed)
+    "#3288bd", "#66c2a5", "#abdda4", "#e6f598",
+    "#fee08b", "#f46d43", "#d53e4f",
+]
+FARM_SIZES = [1, 5, 10, 25, 50, 100]   # bar-chart array sizes
+
 # First-pass operating-depth bands (m) per device, keyed off the device
 # class in devices.json (bottom-fixed / nearshore vs floating / offshore).
 # A deployability HEURISTIC for the GB depth filter — confirm against the
@@ -326,6 +340,47 @@ def load_storm(label):
     z = np.load(os.path.join(DATA_DIR, f"storm_{label}.npz"),
                 allow_pickle=True)
     return {k: z[k] for k in z.files}
+
+
+# --------------------------------------------------------------------------
+# TIER 3 LOADERS — wave rose + extremes (feature-flagged on file presence)
+# --------------------------------------------------------------------------
+def has_rose(domain):
+    return os.path.exists(os.path.join(DATA_DIR, f"rose_{domain}.npz"))
+
+
+def has_extremes(domain):
+    return os.path.exists(os.path.join(DATA_DIR, f"extremes_{domain}.npz"))
+
+
+@st.cache_resource(show_spinner="Loading wave-rose data…")
+def load_rose(domain):
+    """Per-cell joint Hs × direction occurrence histograms (nHs=7, nDir=12)."""
+    z = np.load(os.path.join(DATA_DIR, f"rose_{domain}.npz"),
+                allow_pickle=True)
+    return {k: z[k] for k in z.files}
+
+
+@st.cache_resource(show_spinner="Loading extremes…")
+def load_extremes(domain):
+    """Annual maxima + Gumbel fit + ready-made return-level maps."""
+    z = np.load(os.path.join(DATA_DIR, f"extremes_{domain}.npz"),
+                allow_pickle=True)
+    return {k: z[k] for k in z.files}
+
+
+def hs_band_labels(hs_edges):
+    """['0–1 m', '1–2 m', …, '6+ m'] from edges whose last entry is inf."""
+    labels = []
+    for k in range(len(hs_edges) - 1):
+        lo, hi = float(hs_edges[k]), float(hs_edges[k + 1])
+        labels.append(f"{lo:g}+ m" if np.isinf(hi) else f"{lo:g}–{hi:g} m")
+    return labels
+
+
+def gumbel_level(loc, scale, T):
+    """Return-level Hs for return period T (yr) from the Gumbel fit."""
+    return loc - scale * np.log(-np.log(1.0 - 1.0 / float(T)))
 
 
 def wins_from_code(code_grid):
@@ -577,6 +632,17 @@ LON_AXIS, LAT_AXIS = axes_1d(domain)
 WET = wet_mask(domain)
 N_WET = int(WET.sum())
 _, _, _, N_TS = load_domain(domain)
+
+# Apply any queued inspect-cell change BEFORE the (i, j) number_input
+# widgets are instantiated — Streamlit forbids writing a widget's session
+# key after its widget exists in the current run, so clicks on maps that
+# render after the inspector (e.g. the Extremes map) and the "use best
+# cell" button queue their change here and rerun.
+if "_pending_inspect" in st.session_state:
+    _pi, _pj = st.session_state.pop("_pending_inspect")
+    st.session_state["inspect_i"] = max(0, min(NY - 1, int(_pi)))
+    st.session_state["inspect_j"] = max(0, min(NX - 1, int(_pj)))
+    st.session_state["inspect_domain"] = domain
 
 # Reset the inspect cell when the domain changes (grid indices differ).
 if "inspect_domain" not in st.session_state:
@@ -837,8 +903,9 @@ def render_map(fig, key):
                 new_i = int(np.argmin(np.abs(LAT_AXIS - lat_c)))
                 if (new_i != st.session_state["inspect_i"]
                         or new_j != st.session_state["inspect_j"]):
-                    st.session_state["inspect_i"] = new_i
-                    st.session_state["inspect_j"] = new_j
+                    # Queue (not direct write): this handler may run after
+                    # the inspector number_inputs are instantiated.
+                    st.session_state["_pending_inspect"] = (new_i, new_j)
                     st.rerun()
             except (TypeError, ValueError):
                 pass
@@ -860,8 +927,10 @@ st.markdown(
     f"metric = **{METRIC_TAG}** · method = **{METHOD}**"
 )
 
-tab_energy, tab_atlas, tab_storm, tab_method = st.tabs([
+(tab_energy, tab_atlas, tab_storm, tab_devices, tab_sites, tab_rose,
+ tab_extremes, tab_method) = st.tabs([
     "🗺️ Energy Resource", "🌍 Climate Atlas", "⛈️ Storm Replay",
+    "🔧 Devices", "📍 Site Tools", "🧭 Wave Rose", "📈 Extremes",
     "📖 Methodology",
 ])
 
@@ -1586,7 +1655,433 @@ with tab_storm:
 
 
 # ==========================================================================
-# TAB 4 — METHODOLOGY
+# TAB 4 — DEVICE EXPLORER (Tier 3, A1)
+# ==========================================================================
+with tab_devices:
+    st.subheader("Device Explorer — the 18-WEC library")
+    dev_x = st.selectbox("Device:", DEVICE_NAMES, format_func=_fmt_dev,
+                         key="devx_device")
+    DX = DEVICES[dev_x]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Rated power", f"{DX['rated_power_kW']:,} kW")
+    m2.metric("Class", DX["class"].split(" (")[0],
+              help=DX["class"])
+    m3.metric("Period type", DX["period_type"],
+              help=f"Power matrix indexed on {DX['period_type']} — mapped "
+                   f"to SWAN's `{DX['period_swan']}`. Hs axis: "
+                   f"{DX['hs_swan']}.")
+    m4.metric("Matrix size",
+              f"{len(DX['period_s'])} × {len(DX['hs_m'])}",
+              help="period bins × Hs bins")
+
+    # Power matrix: Hs on the y-axis, period on the x-axis (transpose the
+    # stored power_kW[i_period][j_hs] nesting). Zeros stay 0 — they ARE the
+    # device's cut-in / cut-out envelope.
+    zpm = np.array(DX["power_kW"], dtype=float).T        # (n_hs, n_period)
+    pm_fig = go.Figure(go.Heatmap(
+        z=zpm, x=list(DX["period_s"]), y=list(DX["hs_m"]),
+        colorscale="Viridis",
+        colorbar=standard_colorbar(),
+        hovertemplate=(
+            f"{DX['period_type']} = %{{x:g}} s<br>"
+            "Hm0 = %{y:g} m<br>"
+            "Power = %{z:,.0f} kW<extra></extra>"
+        ),
+    ))
+    pm_fig.update_layout(
+        height=420,
+        margin=dict(l=60, r=RIGHT_MARGIN, t=10, b=45),
+        xaxis_title=f"{DX['period_type']} (s)   [SWAN: {DX['period_swan']}]",
+        yaxis_title="Significant wave height Hm0 (m)",
+        font=dict(size=10), plot_bgcolor="white",
+    )
+    st.plotly_chart(pm_fig, use_container_width=True, config=PLOTLY_CONFIG)
+    st.caption(
+        "The zero cells are the device's own cut-in / cut-out envelope — "
+        "its operating band. Matrices digitised from Majidi et al. (2025) "
+        "and verified cell-by-cell against the published figures "
+        "(18/18 exact)."
+    )
+
+    with st.expander("📋 Summary of all 18 devices", expanded=False):
+        sum_rows = []
+        for nm in DEVICE_NAMES:
+            d = DEVICES[nm]
+            sum_rows.append({
+                "Device": nm,
+                "Class": d["class"],
+                "Rated (kW)": d["rated_power_kW"],
+                "Period": d["period_type"],
+                "SWAN period var": d["period_swan"],
+                "Hs axis (m)": f"{min(d['hs_m']):g}–{max(d['hs_m']):g}",
+                "Period axis (s)":
+                    f"{min(d['period_s']):g}–{max(d['period_s']):g}",
+            })
+        st.dataframe(pd.DataFrame(sum_rows), hide_index=True,
+                     use_container_width=True)
+        st.caption("Click a column header to sort.")
+
+
+# ==========================================================================
+# TAB 5 — SITE TOOLS (Tier 3, A2 + A3)
+# ==========================================================================
+with tab_sites:
+    ii_s = int(st.session_state["inspect_i"])
+    jj_s = int(st.session_state["inspect_j"])
+
+    # ---------------- A2: Array / farm calculator ----------------
+    st.subheader("Array / farm calculator")
+    st.caption(
+        f"Device and method follow the sidebar (**{device}**, {METHOD}); "
+        f"the cell follows the map inspector (currently i={ii_s}, "
+        f"j={jj_s} — click any map or type i, j in the Energy tab)."
+    )
+    if st.button(f"📍 Use the best {METRIC_TAG} cell for {device}",
+                 key="farm_best_btn",
+                 help="Moves the inspect cell to this device's best cell "
+                      "(honours the depth filter if active)."):
+        _g = resource_grid(domain, device, METHOD, METRIC)
+        if DEPTH_MASK is not None:
+            _g = np.where(DEPTH_MASK, _g, np.nan)
+        _flat = int(np.nanargmax(_g))
+        st.session_state["_pending_inspect"] = (_flat // NX, _flat % NX)
+        st.rerun()
+
+    farm_tbl = cell_table(domain, ii_s, jj_s, METHOD)
+    if farm_tbl.empty:
+        st.warning(
+            f"(i={ii_s}, j={jj_s}) is a land cell — pick a wet cell via "
+            "the Energy-tab inspector or the button above."
+        )
+    else:
+        frow = farm_tbl[farm_tbl["device"] == device].iloc[0]
+        aep_unit = float(frow["aep_MWh"])
+        cf_unit = float(frow["cf_pct"])
+
+        n_units = st.slider("Number of units (N):", 1, 100, 10,
+                            key="farm_n")
+        total_aep = n_units * aep_unit
+        homes = total_aep / HOMES_MWH_YR
+
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Per-unit AEP", f"{aep_unit:,.0f} MWh/yr",
+                  help=f"{device} at (i={ii_s}, j={jj_s}), "
+                       f"{fmt_loc(LON_AXIS[jj_s], LAT_AXIS[ii_s])}, "
+                       f"method = {METHOD}.")
+        f2.metric(f"Farm total ({n_units} units)",
+                  (f"{total_aep / 1000:,.1f} GWh/yr"
+                   if total_aep >= 1000 else f"{total_aep:,.0f} MWh/yr"),
+                  help="N × per-unit AEP — no wake or array losses.")
+        f3.metric("Capacity factor", f"{cf_unit:.1f} %",
+                  help="Unchanged by N: CF is a per-unit property.")
+        f4.metric("Homes powered", f"≈ {homes:,.0f}",
+                  help=f"Total AEP ÷ {HOMES_MWH_YR} MWh/yr (average Irish "
+                       "household electricity use, SEAI).")
+
+        farm_bar = go.Figure(go.Bar(
+            x=[str(nn) for nn in FARM_SIZES],
+            y=[nn * aep_unit for nn in FARM_SIZES],
+            marker=dict(color=["#d62728" if nn == n_units else "#4575b4"
+                               for nn in FARM_SIZES]),
+            hovertemplate="N = %{x}<br>%{y:,.0f} MWh/yr<extra></extra>",
+        ))
+        farm_bar.update_layout(
+            height=220, margin=dict(l=60, r=20, t=10, b=40),
+            plot_bgcolor="white", font=dict(size=10),
+            xaxis_title="Array size (units)",
+            yaxis_title="Total AEP (MWh/yr)",
+        )
+        farm_bar.update_yaxes(showgrid=True, gridcolor="#eeeeee")
+        st.plotly_chart(farm_bar, use_container_width=True,
+                        config={"displaylogo": False})
+        st.caption(
+            "⚠️ Linear scaling: N × single-unit AEP assumes no wake / "
+            "array-interaction losses — an upper bound, useful for sizing "
+            "intuition, not a farm design."
+        )
+
+    st.markdown("---")
+
+    # ---------------- A3: Best-sites finder ----------------
+    st.subheader("Best-sites finder")
+    topn = st.number_input("Top N cells:", min_value=5, max_value=100,
+                           value=10, step=5, key="sites_topn")
+    _df_all, _, _, _ = load_domain(domain)
+    sites = _df_all[
+        (_df_all["device"] == device) & (_df_all["method"] == METHOD)
+    ][["i", "j", "lon", "lat", "aep_MWh", "cf_pct"]].copy()
+    if domain == "GB":
+        _dep = load_depth()
+        sites["depth_m"] = _dep[sites["i"].to_numpy(),
+                                sites["j"].to_numpy()]
+        if DEPTH_MASK is not None:
+            sites = sites[(sites["depth_m"] >= D_LO)
+                          & (sites["depth_m"] <= D_HI)]
+    top_sites = sites.nlargest(int(topn), METRIC).reset_index(drop=True)
+    top_show = top_sites.copy()
+    top_show.insert(0, "Rank", np.arange(1, len(top_show) + 1))
+    top_show["lon"] = top_show["lon"].round(3)
+    top_show["lat"] = top_show["lat"].round(3)
+    top_show["aep_MWh"] = top_show["aep_MWh"].round(1)
+    top_show["cf_pct"] = top_show["cf_pct"].round(2)
+    top_show = top_show.rename(columns={
+        "aep_MWh": "AEP (MWh/yr)", "cf_pct": "CF (%)",
+        "depth_m": "Depth (m)",
+    })
+    st.dataframe(top_show, hide_index=True, use_container_width=True)
+    st.download_button(
+        label=f"📥 Download top {len(top_show)} sites (CSV)",
+        data=top_show.to_csv(index=False).encode("utf-8"),
+        file_name=(f"wave_{domain}_top{len(top_show)}_"
+                   f"{device.replace(' ', '_')}_{METRIC_TAG}_{METHOD}.csv"),
+        mime="text/csv",
+        key="sites_dl",
+    )
+    st.caption(
+        f"Ranked by {metric_label.lower()} for **{device}** "
+        f"(method = {METHOD})"
+        + (", honouring the active depth filter"
+           if DEPTH_MASK is not None else "")
+        + ". Type any row's (i, j) into the Energy-tab inspector to see "
+        "all 18 devices there."
+    )
+
+
+# ==========================================================================
+# TAB 6 — WAVE ROSE (Tier 3, B1)
+# ==========================================================================
+with tab_rose:
+    if not has_rose(domain):
+        st.info(
+            f"`rose_{domain}.npz` is not in `data/` yet — run "
+            "`climate_extras.py` to generate it. (Everything else in the "
+            "app works without it.)"
+        )
+    else:
+        R = load_rose(domain)
+        edges = R["hs_edges"]
+        centers = R["dir_centers"].astype(float)
+        band_labels = hs_band_labels(edges)
+        ii_r = int(st.session_state["inspect_i"])
+        jj_r = int(st.session_state["inspect_j"])
+
+        scope = st.radio(
+            "Rose for:", ["Domain-wide", "Inspected cell"],
+            horizontal=True, key="rose_scope",
+            help="Domain-wide = all wet cells pooled. Inspected cell = the "
+                 "map inspector's (i, j) — click any map or type i, j in "
+                 "the Energy tab.",
+        )
+
+        hist = None
+        if scope == "Inspected cell":
+            row = int(R["cell_index"][ii_r, jj_r])
+            if row < 0:
+                st.warning(
+                    f"(i={ii_r}, j={jj_r}) is a land cell — showing the "
+                    "domain-wide rose instead."
+                )
+            else:
+                hist = R["hist"][row]
+                st.caption(
+                    f"Cell (i={ii_r}, j={jj_r}) at "
+                    f"{fmt_loc(LON_AXIS[jj_r], LAT_AXIS[ii_r])}."
+                )
+        if hist is None:
+            hist = R["total"]
+            if scope == "Domain-wide":
+                st.caption(
+                    f"All {N_WET:,} wet cells pooled "
+                    f"({int(R['n_steps']):,} timesteps each)."
+                )
+
+        pct = hist / max(float(hist.sum()), 1.0) * 100.0   # (nHs, nDir)
+
+        dom_k = int(np.argmax(pct.sum(axis=0)))
+        rough = float(pct[[k for k in range(len(band_labels))
+                           if float(edges[k]) >= 4.0], :].sum())
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Dominant direction", f"{centers[dom_k]:.0f}°",
+                  help="Sector with the most occurrences — met convention, "
+                       "'coming from', ° clockwise from north.")
+        r2.metric("Time in dominant sector",
+                  f"{float(pct[:, dom_k].sum()):.1f} %")
+        r3.metric("Time with Hs ≥ 4 m", f"{rough:.1f} %",
+                  help="Sum of the 4–5, 5–6 and 6+ m bands.")
+
+        rose_fig = go.Figure()
+        for k, lab in enumerate(band_labels):
+            rose_fig.add_trace(go.Barpolar(
+                r=pct[k], theta=centers, width=360.0 / len(centers),
+                name=lab, marker_color=ROSE_COLORS[k],
+                marker_line=dict(color="white", width=0.5),
+                hovertemplate=(f"Dir %{{theta:.0f}}° · {lab}: "
+                               "%{r:.2f} %<extra></extra>"),
+            ))
+        rose_fig.update_layout(
+            height=520,
+            margin=dict(l=40, r=40, t=30, b=30),
+            legend=dict(title=dict(text="Hs band"), font=dict(size=10)),
+            polar=dict(
+                angularaxis=dict(
+                    direction="clockwise", rotation=90,
+                    tickmode="array",
+                    tickvals=[0, 45, 90, 135, 180, 225, 270, 315],
+                    ticktext=["N", "NE", "E", "SE", "S", "SW", "W", "NW"],
+                ),
+                radialaxis=dict(ticksuffix=" %", angle=45, tickangle=45,
+                                tickfont=dict(size=9)),
+            ),
+        )
+        st.plotly_chart(rose_fig, use_container_width=True,
+                        config=PLOTLY_CONFIG)
+        st.caption(
+            "Joint Hs × direction occurrence from the full 12-yr hindcast "
+            "(plain counting — no fitting). Directions are met-convention "
+            "**'coming from'** (° clockwise from north, N at top): the "
+            "dominant westerly sector is Atlantic swell arriving from the "
+            "west. 12 sectors × 7 Hs bands; radial axis = % of the record."
+        )
+
+
+# ==========================================================================
+# TAB 7 — EXTREMES / RETURN PERIOD (Tier 3, B2)
+# ==========================================================================
+with tab_extremes:
+    st.warning(EXTREME_CAVEAT)
+    if not has_extremes(domain):
+        st.info(
+            f"`extremes_{domain}.npz` is not in `data/` yet — run "
+            "`climate_extras.py` to generate it. (Everything else in the "
+            "app works without it.)"
+        )
+    else:
+        E = load_extremes(domain)
+        rp_years = [int(y) for y in E["rp_years"]]
+
+        use_custom = st.checkbox("Custom return period",
+                                 key="rp_custom",
+                                 help="Compute any T from the stored "
+                                      "Gumbel fit instead of the "
+                                      "precomputed maps.")
+        if use_custom:
+            T_sel = st.number_input("T (years):", min_value=2,
+                                    max_value=500, value=50,
+                                    key="rp_T_custom")
+            Z_rp = gumbel_level(E["gumbel_loc"], E["gumbel_scale"], T_sel)
+        else:
+            T_sel = st.select_slider("Return period (years):",
+                                     options=rp_years, value=50,
+                                     key="rp_T")
+            Z_rp = E["rp_hs"][rp_years.index(T_sel)]
+
+        finite_rp = Z_rp[np.isfinite(Z_rp)]
+        n_over = int((finite_rp > RP_CLIP_M).sum())
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric(f"Median {T_sel}-yr Hs",
+                  f"{float(np.nanmedian(Z_rp)):.1f} m")
+        e2.metric("p99", f"{float(np.nanpercentile(finite_rp, 99)):.1f} m")
+        e3.metric("Max (stored)", f"{float(np.nanmax(Z_rp)):.1f} m",
+                  help="The stored statistic — the map's COLOUR scale is "
+                       f"capped at {RP_CLIP_M:.0f} m for display, but "
+                       "hover and export show the real values.")
+        e4.metric(f"Cells > {RP_CLIP_M:.0f} m",
+                  f"{n_over:,} ({n_over / max(len(finite_rp), 1) * 100:.2f} %)",
+                  help="Cells whose Gumbel fit over-extrapolates beyond "
+                       "the display cap — noisy fits, not physics.")
+
+        st.subheader(f"{T_sel}-yr return-level Hs  ·  {DMETA['label']}")
+        rp_fig = base_fig()
+        rp_fig.add_trace(go.Heatmap(
+            z=Z_rp, x=LON_AXIS, y=LAT_AXIS,
+            colorscale="Turbo",
+            zmin=0.0, zmax=RP_CLIP_M,       # DISPLAY CLIP ONLY (per spec)
+            hoverongaps=False, connectgaps=False, zsmooth=False,
+            colorbar=standard_colorbar(),
+            hovertemplate=("%{x:.3f}°, %{y:.3f}°<br>"
+                           f"{T_sel}-yr Hs: %{{z:.1f}} m<extra></extra>"),
+        ))
+        add_gb_box(rp_fig)
+        render_map(rp_fig, key="map_extremes")
+        st.caption(
+            f"Colour scale clipped at {RP_CLIP_M:.0f} m **for display "
+            "only** — a ~0.2 % tail of CI cells over-extrapolates to "
+            "20–29 m from noisy Gumbel fits; the stored values are "
+            "untouched (hover any cell to read them). Gumbel fit to the "
+            "12 annual maxima per cell."
+        )
+
+        with st.expander(
+            "📉 Cell detail — annual maxima & fitted return-level curve",
+            expanded=False,
+        ):
+            ii_e = int(st.session_state["inspect_i"])
+            jj_e = int(st.session_state["inspect_j"])
+            am = E["annual_max"][:, ii_e, jj_e]
+            loc_c = float(E["gumbel_loc"][ii_e, jj_e])
+            sc_c = float(E["gumbel_scale"][ii_e, jj_e])
+            if not np.isfinite(am).any():
+                st.warning(
+                    f"(i={ii_e}, j={jj_e}) is a land cell — click a wet "
+                    "cell on the map above."
+                )
+            else:
+                yrs = [int(y) for y in E["years"]]
+                d1, d2, d3 = st.columns(3)
+                d1.metric("Cell", f"i={ii_e}, j={jj_e}",
+                          delta=fmt_loc(LON_AXIS[jj_e], LAT_AXIS[ii_e]),
+                          delta_color="off")
+                d2.metric("Largest annual max",
+                          f"{float(np.nanmax(am)):.1f} m "
+                          f"({yrs[int(np.nanargmax(am))]})")
+                d3.metric("50-yr return level",
+                          f"{gumbel_level(loc_c, sc_c, 50):.1f} m")
+
+                # Empirical plotting positions (Weibull): T = (n+1)/rank
+                am_sorted = np.sort(am[np.isfinite(am)])[::-1]
+                n_am = len(am_sorted)
+                T_emp = (n_am + 1) / np.arange(1, n_am + 1)
+                T_curve = np.logspace(np.log10(1.05), np.log10(200), 80)
+                rl_curve = [gumbel_level(loc_c, sc_c, t) for t in T_curve]
+
+                cell_fig = go.Figure()
+                cell_fig.add_trace(go.Scatter(
+                    x=T_curve, y=rl_curve, mode="lines",
+                    line=dict(color="#1565A0", width=2),
+                    name="Gumbel fit",
+                    hovertemplate=("T = %{x:.1f} yr<br>"
+                                   "Hs = %{y:.1f} m<extra></extra>"),
+                ))
+                cell_fig.add_trace(go.Scatter(
+                    x=T_emp, y=am_sorted, mode="markers",
+                    marker=dict(size=8, color="#d62728",
+                                line=dict(width=1, color="white")),
+                    name="Annual maxima (empirical)",
+                    hovertemplate=("T ≈ %{x:.1f} yr<br>"
+                                   "Hs = %{y:.1f} m<extra></extra>"),
+                ))
+                cell_fig.update_layout(
+                    height=340,
+                    margin=dict(l=60, r=20, t=10, b=45),
+                    plot_bgcolor="white", font=dict(size=10),
+                    xaxis=dict(type="log", title="Return period (yr)",
+                               showgrid=True, gridcolor="#eeeeee"),
+                    yaxis=dict(title="Hs (m)", showgrid=True,
+                               gridcolor="#eeeeee"),
+                    legend=dict(font=dict(size=10)),
+                )
+                st.plotly_chart(cell_fig, use_container_width=True,
+                                config={"displaylogo": False})
+                st.caption(
+                    "Red points: the cell's 12 annual maxima at Weibull "
+                    "plotting positions T = (n+1)/rank. Blue line: the "
+                    "fitted Gumbel return-level curve. " + EXTREME_CAVEAT
+                )
+
+
+# ==========================================================================
+# TAB 8 — METHODOLOGY
 # ==========================================================================
 with tab_method:
     st.markdown(f"""
@@ -1659,6 +2154,23 @@ bands are a first-pass heuristic derived from each device's class
 (bottom-fixed / nearshore vs floating / offshore) — confirm against the
 source paper before siting decisions. No all-Ireland bathymetry yet.
 
+### Wave rose, extremes & site tools (Tier 3)
+
+**Wave rose** — plain occurrence counting over the full hindcast: each
+timestep is binned into 12 direction sectors × 7 Hs bands (0–1 … 6+ m),
+per cell and domain-wide. Directions are met-convention "coming from".
+No fitting, no caveat needed.
+
+**Extremes / return periods** — a Gumbel (EV-I) fit to each cell's 12
+annual maxima; return level Hs(T) = loc − scale·ln(−ln(1 − 1/T)).
+{EXTREME_CAVEAT} The return-period map's colour scale is capped at
+20 m for display — a ~0.2 % tail of CI cells over-extrapolates to
+20–29 m from noisy fits; stored values are untouched.
+
+**Farm calculator** — total AEP = N × the cell's per-unit AEP (no wake
+or array losses: an upper bound). "Homes powered" divides by
+4.2 MWh/yr, the average Irish household electricity use (SEAI).
+
 ### Validation
 
 - Land fraction matches the SWAN land mask in both domains.
@@ -1675,7 +2187,11 @@ source paper before siting decisions. No all-Ireland bathymetry yet.
   upper-bound comparator across devices, not a deployable-resource figure.
 - The depth-deployability bands are first-pass heuristics from the device
   class — not developer specifications. GB only (no CI bathymetry yet).
-- The max-Hs (Extremes) layer is QC-capped at 18 m (see above).
+- The max-Hs (atlas Extremes layer) is QC-capped at 18 m (see above).
+- Return periods extrapolate a 12-yr record — indicative only, wide
+  uncertainty; the map colour scale is display-clipped at 20 m.
+- The farm calculator scales linearly (no wake losses) and "homes
+  powered" uses a single average-consumption constant.
 - No LCOE / economics — deliberately out of scope for this version.
 
 ### Credits
