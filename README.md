@@ -201,12 +201,21 @@ All data files are < 100 MB, so plain Git is fine (no LFS needed).
   `st.plotly_chart(on_select=...)` — Heatmap traces never emit native
   point selections, so that path silently captures nothing (tried,
   reverted). The component keys are per-map AND per-domain.
-- **All inspect-cell writes route through `_pending_inspect`** (applied
-  at the top of the script): map clicks and the "use best cell" button
-  can fire after the inspector's number_inputs are instantiated (the
-  Extremes map renders after them; plotly_events re-delivers its last
-  click on later full runs), and a direct session write there raises
-  Streamlit's modified-after-instantiation error. Leave the queue in.
+- **All inspect-cell writes route through `_pending_inspect`**: map
+  clicks and the "use best cell" button can fire after the inspector's
+  number_inputs are instantiated, and a direct session write there
+  raises Streamlit's modified-after-instantiation error. The queue is
+  applied in two places — at the top of the script (full-rerun paths)
+  and via `apply_pending_inspect()` at the top of the Energy/Extremes
+  fragments (fragment-scoped click path). Leave both in.
+- **Map clicks are fragment-scoped**: `render_map` queues the cell and
+  calls `fragment_rerun()` — NEVER an app-scoped `st.rerun()` on a
+  click, which rebuilt all 8 tabs + both plotly_events iframes and
+  blocked the app ~30 s per click. Other tabs pick the new cell up on
+  their next rerun. The clickable maps also render at `cstride`
+  (~10k points incl. their land layer) because plotly_events
+  re-serialises the whole figure into its iframe on every rerun —
+  clicks still snap to exact full-res cells via argmin.
 - Heavy per-rerun work is cached — `export_csv` (sidebar CSV bytes),
   `top_sites`, `storm_stats`, `rp_level_map`, and the two Energy figure
   builders. If you add a table/CSV/figure that's rebuilt from the big

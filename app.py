@@ -191,19 +191,49 @@ def fragment(func):
 
 
 def dstride(domain):
-    """DISPLAY stride for static map heatmaps: GB (309×485 = 150k cells)
-    is thinned 2× (→ ~37k points, ~4× lighter payload, visually identical
-    at map zoom); CI (61k cells) ships at full resolution. Analysis, KPIs,
-    the (i, j) inspector and CSV exports always use the FULL grids —
-    only what goes into go.Heatmap is strided."""
+    """DISPLAY stride for static (non-clickable) map heatmaps: GB
+    (309×485 = 150k cells) is thinned 2× (→ ~37k points); CI (61k cells)
+    ships at full resolution. Analysis, KPIs, the (i, j) inspector and
+    CSV exports always use the FULL grids — only what goes into
+    go.Heatmap is strided."""
     return 2 if domain == "GB" else 1
 
 
+def cstride(domain):
+    """(row, col) stride for the CLICKABLE maps (rendered through
+    plotly_events, which re-serialises the whole figure into its iframe
+    on every rerun). Target ~8–12k points: CI 181×341 → 91×114 ≈ 10.4k;
+    GB 309×485 → 78×122 ≈ 9.5k. Clicks still snap to the exact full-res
+    cell via argmin on the axes, so no precision is lost — only the
+    rendered z is coarsened."""
+    return (2, 3) if domain == "CI" else (4, 4)
+
+
+def fragment_rerun():
+    """Rerun ONLY the current fragment (Streamlit ≥ 1.37). Used on the
+    map-click path — an app-scoped rerun there rebuilt all 8 tabs plus
+    both plotly_events iframes and blocked the app for ~30 s per click."""
+    if hasattr(st, "fragment"):
+        st.rerun(scope="fragment")
+    else:
+        st.rerun()              # pre-fragment Streamlit: app == one blob
+
+
+def apply_pending_inspect():
+    """Apply a queued inspect-cell change at the TOP of a fragment,
+    before that fragment's (i, j) number_inputs are instantiated — this
+    is what lets the click path stay fragment-scoped with no
+    modified-after-instantiation error."""
+    if "_pending_inspect" in st.session_state:
+        _pi, _pj = st.session_state.pop("_pending_inspect")
+        st.session_state["inspect_i"] = max(0, min(NY - 1, int(_pi)))
+        st.session_state["inspect_j"] = max(0, min(NX - 1, int(_pj)))
+
+
 def full_rerun():
-    """Rerun the WHOLE app from inside a fragment (st.rerun's default
-    scope is already "app"; the try/except covers pre-scope Streamlit).
-    Used by the Site-Tools 'use best cell' button. Map clicks call plain
-    st.rerun() in render_map — same effect."""
+    """Rerun the WHOLE app from inside a fragment. Used ONLY by the
+    Site-Tools 'use best cell' button (rare, explicit action). Map
+    clicks must NEVER use this — they go through fragment_rerun()."""
     try:
         st.rerun(scope="app")
     except TypeError:           # older Streamlit: no scope kw, no fragments
@@ -921,13 +951,19 @@ PLOTLY_CONFIG = {
 }
 
 
-def base_fig():
+def base_fig(stride=None):
     """New figure with the gray land underlay + fixed geo axes.
-    The land trace is display-strided like the data traces (GB 2×)."""
-    _s = dstride(domain)
+    `stride` = (row, col) for the land trace; defaults to the display
+    stride. Clickable maps pass cstride(domain) so their land layer is
+    as light as their data layer (both live inside the plotly_events
+    iframe payload)."""
+    if stride is None:
+        _sr = _sc = dstride(domain)
+    else:
+        _sr, _sc = stride
     fig = go.Figure()
     fig.add_trace(go.Heatmap(
-        z=LAND[::_s, ::_s], x=LON_AXIS[::_s], y=LAT_AXIS[::_s],
+        z=LAND[::_sr, ::_sc], x=LON_AXIS[::_sc], y=LAT_AXIS[::_sr],
         colorscale=[[0.0, LAND_COLOR], [1.0, LAND_COLOR]],
         showscale=False, hoverinfo="skip",
         zmin=0, zmax=1, zsmooth=False,
@@ -1013,12 +1049,11 @@ def render_map(fig, key):
     on screen at once (Energy + Extremes), and a domain switch must not
     inherit the other domain's last click.
 
-    The write goes through the tiny _pending_inspect queue (applied at
-    the top of the next run) rather than a direct session write: the
-    Extremes map renders AFTER the Energy inspector's number_inputs, and
-    plotly_events re-delivers its last click on later full runs — a
-    direct write there would raise Streamlit's modified-after-
-    instantiation error. Behaviour is identical to set-state + rerun.
+    The click path is FRAGMENT-scoped end to end: the write goes through
+    the _pending_inspect queue + fragment_rerun(), and each fragment
+    with a clickable map calls apply_pending_inspect() at its top. NEVER
+    put an app-scoped st.rerun() here — that rebuilt all 8 tabs plus
+    both plotly_events iframes and blocked the app ~30 s per click.
     """
     add_inspect_marker(fig)
     if HAS_PLOTLY_EVENTS:
@@ -1036,7 +1071,7 @@ def render_map(fig, key):
                 if (new_i, new_j) != (int(st.session_state["inspect_i"]),
                                       int(st.session_state["inspect_j"])):
                     st.session_state["_pending_inspect"] = (new_i, new_j)
-                    st.rerun()
+                    fragment_rerun()
             except (TypeError, ValueError, KeyError):
                 pass
         st.caption("💡 Click any cell to load it into the Cell inspector "
@@ -1062,10 +1097,10 @@ def single_device_fig(domain, metric_label, device, method, d_lo, d_hi):
         dep = load_depth()
         g = np.where(np.isfinite(dep) & (dep >= d_lo) & (dep <= d_hi),
                      g, np.nan)
-    s = dstride(domain)
-    fig = base_fig()
+    sr, sc = cstride(domain)          # clickable map — extra-light
+    fig = base_fig(stride=(sr, sc))
     fig.add_trace(go.Heatmap(
-        z=g[::s, ::s], x=LON_AXIS[::s], y=LAT_AXIS[::s],
+        z=g[::sr, ::sc], x=LON_AXIS[::sc], y=LAT_AXIS[::sr],
         colorscale=cmap,
         zmin=float(np.nanmin(g)), zmax=float(np.nanmax(g)),
         hoverongaps=False, connectgaps=False, zsmooth=False,
@@ -1090,9 +1125,9 @@ def best_device_fig(domain, metric_label, method, d_lo, d_hi):
         m = np.isfinite(dep) & (dep >= d_lo) & (dep <= d_hi)
         code = np.where(m, code, np.nan)
         best_val = np.where(m, best_val, np.nan)
-    s = dstride(domain)
-    code_s = code[::s, ::s]
-    val_s = best_val[::s, ::s]
+    sr, sc = cstride(domain)          # clickable map — extra-light
+    code_s = code[::sr, ::sc]
+    val_s = best_val[::sr, ::sc]
 
     n = len(DEVICE_NAMES)
     cscale = []
@@ -1104,9 +1139,9 @@ def best_device_fig(domain, metric_label, method, d_lo, d_hi):
     valid = ~np.isnan(code_s)
     hover_names[valid] = name_arr[code_s[valid].astype(int)]
 
-    fig = base_fig()
+    fig = base_fig(stride=(sr, sc))
     fig.add_trace(go.Heatmap(
-        z=code_s, x=LON_AXIS[::s], y=LAT_AXIS[::s],
+        z=code_s, x=LON_AXIS[::sc], y=LAT_AXIS[::sr],
         colorscale=cscale,
         zmin=-0.5, zmax=n - 0.5,
         hoverongaps=False, connectgaps=False, zsmooth=False,
@@ -1157,6 +1192,8 @@ st.markdown(
 # ==========================================================================
 @fragment
 def render_energy():
+    apply_pending_inspect()     # fragment-scoped click: apply before the
+                                # (i, j) number_inputs are instantiated
 
     grid_a = resource_grid(domain, device, METHOD, METRIC)
     cf_a   = resource_grid(domain, device, METHOD, "cf_pct")
@@ -1352,11 +1389,11 @@ def render_energy():
             abs_max = float(np.nanmax(np.abs(finite))) if finite.size else 1.0
             if abs_max == 0:
                 abs_max = 1.0
-            _s = dstride(domain)
-            fig = base_fig()
+            _sr, _sc = cstride(domain)     # clickable map — extra-light
+            fig = base_fig(stride=(_sr, _sc))
             fig.add_trace(go.Heatmap(
-                z=diff_grid[::_s, ::_s], x=LON_AXIS[::_s],
-                y=LAT_AXIS[::_s],
+                z=diff_grid[::_sr, ::_sc], x=LON_AXIS[::_sc],
+                y=LAT_AXIS[::_sr],
                 colorscale="RdBu_r",
                 zmin=-abs_max, zmax=abs_max, zmid=0,
                 hoverongaps=False, connectgaps=False, zsmooth=False,
@@ -2133,6 +2170,7 @@ def render_rose():
 # ==========================================================================
 @fragment
 def render_extremes():
+    apply_pending_inspect()     # fragment-scoped click on the rp map
     st.warning(EXTREME_CAVEAT)
     if not has_extremes(domain):
         st.info(
@@ -2175,10 +2213,10 @@ def render_extremes():
                        "the display cap — noisy fits, not physics.")
 
         st.subheader(f"{T_sel}-yr return-level Hs  ·  {DMETA['label']}")
-        _s = dstride(domain)
-        rp_fig = base_fig()
+        _sr, _sc = cstride(domain)         # clickable map — extra-light
+        rp_fig = base_fig(stride=(_sr, _sc))
         rp_fig.add_trace(go.Heatmap(
-            z=Z_rp[::_s, ::_s], x=LON_AXIS[::_s], y=LAT_AXIS[::_s],
+            z=Z_rp[::_sr, ::_sc], x=LON_AXIS[::_sc], y=LAT_AXIS[::_sr],
             colorscale="Turbo",
             zmin=0.0, zmax=RP_CLIP_M,       # DISPLAY CLIP ONLY (per spec)
             hoverongaps=False, connectgaps=False, zsmooth=False,
