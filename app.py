@@ -979,11 +979,53 @@ def add_inspect_marker(fig):
         mode="markers",
         marker=dict(symbol="x", size=13, color="white",
                     line=dict(width=2.5, color="black")),
+        # Never dim, even while a click-selection is active elsewhere —
+        # plotly fades "unselected" scatter points by default.
+        selected=dict(marker=dict(opacity=1)),
+        unselected=dict(marker=dict(opacity=1)),
         showlegend=False,
         hovertemplate=(
             f"Inspect cell (i={ii}, j={jj})<br>"
             f"{fmt_loc(LON_AXIS[jj], LAT_AXIS[ii])}<extra></extra>"
         ),
+    ))
+
+
+@st.cache_data(show_spinner=False)
+def click_layer_xy(domain):
+    """Cell-centre points for the invisible click overlay, at DISPLAY
+    (strided) resolution, wet cells only — clicking land does nothing.
+    customdata carries the FULL-RES (i, j) so the inspector always lands
+    on a real grid cell; coordinates are rounded to shorten the JSON
+    (0.0001° ≈ 11 m, far below cell size — precision comes from
+    customdata, not the point position)."""
+    lon_ax, lat_ax = axes_1d(domain)
+    s = dstride(domain)
+    ii = np.arange(0, lat_ax.size, s)
+    jj = np.arange(0, lon_ax.size, s)
+    J, I = np.meshgrid(jj, ii)
+    I, J = I.ravel(), J.ravel()
+    wet = wet_mask(domain)[I, J]
+    I, J = I[wet], J[wet]
+    x = np.round(lon_ax[J], 4)
+    y = np.round(lat_ax[I], 4)
+    cd = np.stack([I, J], axis=1).astype(np.int32)
+    return x, y, cd
+
+
+def add_click_layer(fig, domain):
+    """Invisible-but-hit-testable Scattergl overlay — Streamlit's
+    on_select never fires 'points' for a Heatmap trace, so this layer is
+    what actually captures map clicks. alpha-0.01 markers (not fully
+    transparent: some Plotly builds skip rgba(0,0,0,0) in hit testing)."""
+    x, y, cd = click_layer_xy(domain)
+    fig.add_trace(go.Scattergl(
+        x=x, y=y, customdata=cd,
+        mode="markers",
+        marker=dict(size=14, color="rgba(0,0,0,0.01)"),
+        selected=dict(marker=dict(opacity=0)),
+        unselected=dict(marker=dict(opacity=0)),
+        hoverinfo="skip", showlegend=False, name="",
     ))
 
 
@@ -1019,8 +1061,14 @@ def render_map(fig, key):
     always renders BEFORE the (i, j) number_inputs of its own fragment,
     and other fragments' widgets are not instantiated during this
     fragment's rerun.
+
+    CRITICAL: Heatmap traces never emit point selections — the clicks
+    are captured by the invisible Scattergl overlay (add_click_layer),
+    and the cell comes from the point's customdata = (i, j), not from
+    x/y coordinate guessing.
     """
     add_inspect_marker(fig)
+    add_click_layer(fig, domain)
     wkey = f"{key}_{domain}"
     event = st.plotly_chart(
         fig, key=wkey, on_select="rerun", selection_mode="points",
@@ -1032,17 +1080,12 @@ def render_map(fig, key):
         if sel:
             pts = sel.get("points") or None
     if pts:
-        try:
-            lon_c = float(pts[0].get("x"))
-            lat_c = float(pts[0].get("y"))
-        except (TypeError, ValueError):
-            lon_c = None
-        if lon_c is not None:
-            marker = (round(lon_c, 6), round(lat_c, 6))
+        cd = pts[0].get("customdata")
+        if cd is not None and len(cd) == 2:
+            new_i, new_j = int(cd[0]), int(cd[1])
+            marker = (new_i, new_j)
             if st.session_state.get(f"_sel_{wkey}") != marker:
                 st.session_state[f"_sel_{wkey}"] = marker
-                new_j = int(np.argmin(np.abs(LON_AXIS - lon_c)))
-                new_i = int(np.argmin(np.abs(LAT_AXIS - lat_c)))
                 if (new_i, new_j) != (int(st.session_state["inspect_i"]),
                                       int(st.session_state["inspect_j"])):
                     st.session_state["inspect_i"] = new_i

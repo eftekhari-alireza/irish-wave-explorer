@@ -199,6 +199,13 @@ All data files are < 100 MB, so plain Git is fine (no LFS needed).
   rerun on click. A click updates only its own tab; other tabs read the
   new inspect cell on their next rerun. The per-key `_sel_*` markers
   dedup Streamlit's re-delivery of old selections — keep them.
+- **Clicks are captured by the invisible Scattergl overlay**
+  (`add_click_layer`), NOT the heatmap — Heatmap traces never emit point
+  selections, so removing the overlay silently kills clicking again. The
+  overlay is wet-cells-only at display stride, carries the exact full-res
+  `(i, j)` in `customdata`, and uses alpha-0.01 markers (fully
+  transparent `rgba(0,0,0,0)` is skipped by hit testing in some Plotly
+  builds — don't "clean" that up).
 - The "use best cell" button still routes through `_pending_inspect` +
   `full_rerun()`: it can fire during a full run (after the inspector
   widgets are instantiated), so a direct write would raise. Leave it.
