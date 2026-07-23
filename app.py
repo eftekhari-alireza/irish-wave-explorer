@@ -34,13 +34,10 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# Optional: enables click-to-inspect on the map. If not installed, the app
-# falls back to typed (i, j) input only.
-try:
-    from streamlit_plotly_events import plotly_events
-    HAS_PLOTLY_EVENTS = True
-except ImportError:
-    HAS_PLOTLY_EVENTS = False
+# Map clicks use Streamlit's NATIVE plotly selection API
+# (st.plotly_chart(on_select="rerun"), Streamlit >= 1.35) — the old
+# streamlit-plotly-events iframe component was unreliable with large
+# heatmaps and forced full-app reruns; it has been removed.
 
 # --------------------------------------------------------------------------
 # PATHS
@@ -198,9 +195,11 @@ def dstride(domain):
 
 
 def full_rerun():
-    """Rerun the WHOLE app, even when called from inside a fragment.
-    The inspect cell is read by several fragments (Energy, Site Tools,
-    Rose, Extremes), so any change to it must escape fragment scope."""
+    """Rerun the WHOLE app from inside a fragment. Used ONLY by the
+    Site-Tools 'use best cell' button (rare, explicit action) via the
+    _pending_inspect queue. Map clicks and typed (i, j) changes stay
+    fragment-scoped on purpose — other tabs pick the new cell up on
+    their next rerun. Don't reintroduce full reruns on click paths."""
     try:
         st.rerun(scope="app")
     except TypeError:           # older Streamlit: no scope kw, no fragments
@@ -328,9 +327,10 @@ def leaderboard(domain, method):
     return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=512)
 def cell_table(domain, i, j, method):
-    """All 18 devices at one cell, for the active method."""
+    """All 18 devices at one cell, for the active method.
+    max_entries bounds the cache — every clicked cell adds an entry."""
     df, _, _, _ = load_domain(domain)
     s = df[(df["i"] == i) & (df["j"] == j) & (df["method"] == method)]
     return s[["device", "rated_kW", "period_type", "aep_MWh", "cf_pct"]].copy()
@@ -417,6 +417,88 @@ def wins_from_code(code_grid):
     counts = np.bincount(code_grid[valid].astype(int),
                          minlength=len(DEVICE_NAMES))
     return {DEVICE_NAMES[k]: int(counts[k]) for k in range(len(DEVICE_NAMES))}
+
+
+@st.cache_data(show_spinner=False)
+def storm_stats(label):
+    """(overall max Hs, ceil for the colour scale) — computed once. The
+    inline np.nanmax over the 8.9M-element frame stack used to run on
+    every rerun of the storm tab."""
+    hs = load_storm(label)["hs"]
+    peak_hs = float(np.nanmax(hs))
+    return peak_hs, float(np.ceil(peak_hs))
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def top_sites(domain, device, method, metric, topn, d_lo, d_hi):
+    """Top-N cells for the best-sites finder — cached: the 2.8M-row filter
+    + nlargest was rerunning on every Site-Tools repaint."""
+    df_all, _, _, _ = load_domain(domain)
+    sites = df_all[
+        (df_all["device"] == device) & (df_all["method"] == method)
+    ][["i", "j", "lon", "lat", "aep_MWh", "cf_pct"]].copy()
+    if domain == "GB":
+        dep = load_depth()
+        sites["depth_m"] = dep[sites["i"].to_numpy(),
+                               sites["j"].to_numpy()]
+        if d_lo is not None:
+            sites = sites[(sites["depth_m"] >= d_lo)
+                          & (sites["depth_m"] <= d_hi)]
+    return sites.nlargest(int(topn), metric).reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def rp_level_map(domain, T_sel, custom):
+    """Full-resolution return-level grid for KPIs + the map builder."""
+    E = load_extremes(domain)
+    if custom:
+        return gumbel_level(E["gumbel_loc"], E["gumbel_scale"], T_sel)
+    rp_years = [int(y) for y in E["rp_years"]]
+    return E["rp_hs"][rp_years.index(int(T_sel))]
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def export_csv(domain, mode, metric_label, device, method, d_lo, d_hi):
+    """Sidebar-export CSV bytes, cached. Building an up-to-8 MB CSV from a
+    78k-row slice ran on EVERY full rerun before; now it rebuilds only
+    when (domain, mode, metric, device, method, depth band) change.
+    Returns (csv_bytes, n_rows, filename)."""
+    metric, tag, _, _ = METRICS[metric_label]
+    if mode == "Best device per cell":
+        code, bval, _ = best_device_grids(domain, method, metric)
+        if d_lo is not None:
+            dep = load_depth()
+            m = np.isfinite(dep) & (dep >= d_lo) & (dep <= d_hi)
+            code = np.where(m, code, np.nan)
+            bval = np.where(m, bval, np.nan)
+        valid = ~np.isnan(code)
+        ii_idx, jj_idx = np.where(valid)
+        lon_ax, lat_ax = axes_1d(domain)
+        name_arr = np.array(DEVICE_NAMES, dtype=object)
+        out = pd.DataFrame({
+            "i": ii_idx, "j": jj_idx,
+            "lon": lon_ax[jj_idx], "lat": lat_ax[ii_idx],
+            "best_device": name_arr[code[valid].astype(int)],
+            f"best_{metric}": bval[valid],
+            "method": method,
+        })
+        if domain == "GB":
+            out["depth_m"] = load_depth()[ii_idx, jj_idx]
+        fname = f"wave_{domain}_best_device_{tag}_{method}.csv"
+    else:
+        df_all, _, _, _ = load_domain(domain)
+        out = df_all[
+            (df_all["device"] == device) & (df_all["method"] == method)
+        ][["i", "j", "lon", "lat", "device", "rated_kW", "period_type",
+           "method", "aep_MWh", "cf_pct"]].copy()
+        if domain == "GB":
+            dep = load_depth()
+            out["depth_m"] = dep[out["i"].to_numpy(), out["j"].to_numpy()]
+            if d_lo is not None:
+                out = out[(out["depth_m"] >= d_lo)
+                          & (out["depth_m"] <= d_hi)]
+        fname = f"wave_{domain}_{device.replace(' ', '_')}_{method}.csv"
+    return out.to_csv(index=False).encode("utf-8"), len(out), fname
 
 
 # --------------------------------------------------------------------------
@@ -671,8 +753,6 @@ if "_pending_inspect" in st.session_state:
     st.session_state["inspect_i"] = max(0, min(NY - 1, int(_pi)))
     st.session_state["inspect_j"] = max(0, min(NX - 1, int(_pj)))
     st.session_state["inspect_domain"] = domain
-    st.session_state["_last_inspect"] = (st.session_state["inspect_i"],
-                                         st.session_state["inspect_j"])
 
 # Reset the inspect cell when the domain changes (grid indices differ).
 if "inspect_domain" not in st.session_state:
@@ -684,14 +764,10 @@ if "inspect_domain" not in st.session_state:
         st.session_state["inspect_i"], st.session_state["inspect_j"] = \
             default_cell(domain)
     st.session_state["inspect_domain"] = domain
-    st.session_state["_last_inspect"] = (st.session_state["inspect_i"],
-                                         st.session_state["inspect_j"])
 elif st.session_state["inspect_domain"] != domain:
     st.session_state["inspect_i"], st.session_state["inspect_j"] = \
         default_cell(domain)
     st.session_state["inspect_domain"] = domain
-    st.session_state["_last_inspect"] = (st.session_state["inspect_i"],
-                                         st.session_state["inspect_j"])
 
 # --- 2. device + mode ----
 st.sidebar.subheader("2. Device")
@@ -924,35 +1000,55 @@ def standard_colorbar():
 
 
 def render_map(fig, key):
-    """Render with click-to-inspect if available; else static chart."""
+    """Clickable map via Streamlit's native plotly selection API.
+
+    The chart lives inside a tab fragment, so on_select="rerun" reruns
+    ONLY that fragment — a click updates the current tab in place instead
+    of rebuilding all eight (the old streamlit-plotly-events + full-rerun
+    path is what made the map unusable). Other tabs pick the new cell up
+    from session_state on their next rerun.
+
+    Two guards:
+    - the widget key includes the domain, so selection state cannot leak
+      across a CI <-> GB switch;
+    - a per-key marker dedups Streamlit's re-delivery of the SAME
+      selection on later reruns — without it, a stale click would clobber
+      a newer typed (i, j).
+
+    The inspect write is direct (no _pending_inspect queue): the map
+    always renders BEFORE the (i, j) number_inputs of its own fragment,
+    and other fragments' widgets are not instantiated during this
+    fragment's rerun.
+    """
     add_inspect_marker(fig)
-    if HAS_PLOTLY_EVENTS:
-        selected = plotly_events(
-            fig, click_event=True, hover_event=False, select_event=False,
-            override_height=FIG_HEIGHT + 10, key=key,
-        )
-        if selected:
-            pt = selected[0]
-            try:
-                lon_c = float(pt.get("x"))
-                lat_c = float(pt.get("y"))
+    wkey = f"{key}_{domain}"
+    event = st.plotly_chart(
+        fig, key=wkey, on_select="rerun", selection_mode="points",
+        use_container_width=True, config=PLOTLY_CONFIG,
+    )
+    pts = None
+    if event is not None:
+        sel = getattr(event, "selection", None)
+        if sel:
+            pts = sel.get("points") or None
+    if pts:
+        try:
+            lon_c = float(pts[0].get("x"))
+            lat_c = float(pts[0].get("y"))
+        except (TypeError, ValueError):
+            lon_c = None
+        if lon_c is not None:
+            marker = (round(lon_c, 6), round(lat_c, 6))
+            if st.session_state.get(f"_sel_{wkey}") != marker:
+                st.session_state[f"_sel_{wkey}"] = marker
                 new_j = int(np.argmin(np.abs(LON_AXIS - lon_c)))
                 new_i = int(np.argmin(np.abs(LAT_AXIS - lat_c)))
-                if (new_i != st.session_state["inspect_i"]
-                        or new_j != st.session_state["inspect_j"]):
-                    # Queue (not direct write): this handler may run after
-                    # the inspector number_inputs are instantiated. Full
-                    # rerun: other fragments read the inspect cell.
-                    st.session_state["_pending_inspect"] = (new_i, new_j)
-                    full_rerun()
-            except (TypeError, ValueError):
-                pass
-        st.caption("💡 Click any cell to load it into the Cell inspector "
-                   "below.")
-    else:
-        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
-        st.caption("💡 Tip: `pip install streamlit-plotly-events` to enable "
-                   "click-to-inspect. Use the camera button to save a PNG.")
+                if (new_i, new_j) != (int(st.session_state["inspect_i"]),
+                                      int(st.session_state["inspect_j"])):
+                    st.session_state["inspect_i"] = new_i
+                    st.session_state["inspect_j"] = new_j
+    st.caption("💡 Click any cell to load it into the Cell inspector "
+               "below. Use the camera button to save a PNG.")
 
 
 # --------------------------------------------------------------------------
@@ -1338,12 +1434,6 @@ def render_energy():
 
         ii = int(st.session_state["inspect_i"])
         jj = int(st.session_state["inspect_j"])
-        # Typed (i, j) changes land during a fragment-scoped rerun of this
-        # tab only — promote them to a full rerun so Site Tools / Rose /
-        # Extremes repaint with the new cell.
-        if st.session_state.get("_last_inspect") != (ii, jj):
-            st.session_state["_last_inspect"] = (ii, jj)
-            full_rerun()
         tbl = cell_table(domain, ii, jj, METHOD)
 
         if tbl.empty:
@@ -1663,8 +1753,9 @@ def render_storm():
     def _stamp(t):
         return f"{hours[t] // 24 + 1} {mon} {syear}, {hours[t] % 24:02d}:00"
 
+    peak_hs, hs_ceil = storm_stats(label)
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Peak Hs", f"{float(np.nanmax(hs_all)):.1f} m",
+    k1.metric("Peak Hs", f"{peak_hs:.1f} m",
               help="Largest significant wave height anywhere in the domain "
                    "during the 144-h window.")
     k2.metric("Peak hour", _stamp(peak))
@@ -1709,7 +1800,7 @@ def render_storm():
         SXp = S["Xp"].astype(float)
         SYp = S["Yp"].astype(float)
         hs_t = hs_all[t]
-        vmax = float(np.ceil(np.nanmax(hs_all)))
+        vmax = hs_ceil
 
         sfig = go.Figure()
         sfig.add_trace(go.Heatmap(
@@ -1910,19 +2001,11 @@ def render_sites():
     st.subheader("Best-sites finder")
     topn = st.number_input("Top N cells:", min_value=5, max_value=100,
                            value=10, step=5, key="sites_topn")
-    _df_all, _, _, _ = load_domain(domain)
-    sites = _df_all[
-        (_df_all["device"] == device) & (_df_all["method"] == METHOD)
-    ][["i", "j", "lon", "lat", "aep_MWh", "cf_pct"]].copy()
-    if domain == "GB":
-        _dep = load_depth()
-        sites["depth_m"] = _dep[sites["i"].to_numpy(),
-                                sites["j"].to_numpy()]
-        if DEPTH_MASK is not None:
-            sites = sites[(sites["depth_m"] >= D_LO)
-                          & (sites["depth_m"] <= D_HI)]
-    top_sites = sites.nlargest(int(topn), METRIC).reset_index(drop=True)
-    top_show = top_sites.copy()
+    top_show = top_sites(
+        domain, device, METHOD, METRIC, int(topn),
+        D_LO if DEPTH_MASK is not None else None,
+        D_HI if DEPTH_MASK is not None else None,
+    ).copy()
     top_show.insert(0, "Rank", np.arange(1, len(top_show) + 1))
     top_show["lon"] = top_show["lon"].round(3)
     top_show["lat"] = top_show["lat"].round(3)
@@ -2074,12 +2157,11 @@ def render_extremes():
             T_sel = st.number_input("T (years):", min_value=2,
                                     max_value=500, value=50,
                                     key="rp_T_custom")
-            Z_rp = gumbel_level(E["gumbel_loc"], E["gumbel_scale"], T_sel)
         else:
             T_sel = st.select_slider("Return period (years):",
                                      options=rp_years, value=50,
                                      key="rp_T")
-            Z_rp = E["rp_hs"][rp_years.index(T_sel)]
+        Z_rp = rp_level_map(domain, int(T_sel), bool(use_custom))
 
         finite_rp = Z_rp[np.isfinite(Z_rp)]
         n_over = int((finite_rp > RP_CLIP_M).sum())
@@ -2332,47 +2414,18 @@ Dr Stephen Nash). Device matrices: Majidi et al. (2025). Sibling app:
 
 # --------------------------------------------------------------------------
 # SIDEBAR EXPORT (6.) — visible data as CSV. Mode- and depth-filter-aware.
+# The bytes come from a cached builder: rebuilding an up-to-8 MB CSV on
+# every rerun was one of the biggest per-interaction costs.
 # --------------------------------------------------------------------------
 st.sidebar.subheader("6. Export")
 
-if mode == "Best device per cell":
-    _code, _bval, _ = best_device_grids(domain, METHOD, METRIC)
-    if DEPTH_MASK is not None:
-        _code = np.where(DEPTH_MASK, _code, np.nan)
-        _bval = np.where(DEPTH_MASK, _bval, np.nan)
-    valid = ~np.isnan(_code)
-    ii_idx, jj_idx = np.where(valid)
-    name_arr = np.array(DEVICE_NAMES, dtype=object)
-    _export_df = pd.DataFrame({
-        "i": ii_idx, "j": jj_idx,
-        "lon": LON_AXIS[jj_idx], "lat": LAT_AXIS[ii_idx],
-        "best_device": name_arr[_code[valid].astype(int)],
-        f"best_{METRIC}": _bval[valid],
-        "method": METHOD,
-    })
-    if domain == "GB":
-        _export_df["depth_m"] = load_depth()[ii_idx, jj_idx]
-    _fname = f"wave_{domain}_best_device_{METRIC_TAG}_{METHOD}.csv"
-else:
-    _df_all, _, _, _ = load_domain(domain)
-    _export_df = _df_all[
-        (_df_all["device"] == device) & (_df_all["method"] == METHOD)
-    ][["i", "j", "lon", "lat", "device", "rated_kW", "period_type",
-       "method", "aep_MWh", "cf_pct"]].copy()
-    if domain == "GB":
-        _dep = load_depth()
-        _export_df["depth_m"] = _dep[_export_df["i"].to_numpy(),
-                                     _export_df["j"].to_numpy()]
-        if DEPTH_MASK is not None:
-            _export_df = _export_df[
-                (_export_df["depth_m"] >= D_LO)
-                & (_export_df["depth_m"] <= D_HI)
-            ]
-    _fname = f"wave_{domain}_{device.replace(' ', '_')}_{METHOD}.csv"
-
-_csv_bytes = _export_df.to_csv(index=False).encode("utf-8")
+_csv_bytes, _n_rows, _fname = export_csv(
+    domain, mode, metric_label, device, METHOD,
+    D_LO if DEPTH_MASK is not None else None,
+    D_HI if DEPTH_MASK is not None else None,
+)
 st.sidebar.download_button(
-    label=f"📥 Download visible cells ({len(_export_df):,} rows)",
+    label=f"📥 Download visible cells ({_n_rows:,} rows)",
     data=_csv_bytes,
     file_name=_fname,
     mime="text/csv",

@@ -30,9 +30,9 @@ pip install -r requirements.txt
 streamlit run app.py          # opens at http://localhost:8501
 ```
 
-The baked data (~73 MB) ships with the repo — nothing to regenerate. If
-`streamlit-plotly-events` is missing the app still works; you just type
-(i, j) instead of clicking the map.
+The baked data ships with the repo — nothing to regenerate. Map clicks
+use Streamlit's native `st.plotly_chart(on_select=...)` (Streamlit ≥
+1.35); there are no third-party components.
 
 ## What's in Tier 1
 
@@ -193,10 +193,19 @@ All data files are < 100 MB, so plain Git is fine (no LFS needed).
   ~0.2 % tail of CI cells over-extrapolates from noisy Gumbel fits. The
   stored `rp_hs`/`gumbel_*` values are honest statistics; never alter
   them, and keep the short-record caveat on the Extremes tab.
-- Inspect-cell changes from late-rendering widgets (Extremes map clicks,
-  the "use best cell" button) must go through the `_pending_inspect`
-  queue, never write `inspect_i`/`inspect_j` directly — Streamlit forbids
-  writing a widget's key after it is instantiated.
+- **Map clicks are native and fragment-scoped**: `render_map` uses
+  `st.plotly_chart(on_select="rerun")` — never reintroduce
+  `streamlit-plotly-events` (unmaintained, unreliable) or a full-app
+  rerun on click. A click updates only its own tab; other tabs read the
+  new inspect cell on their next rerun. The per-key `_sel_*` markers
+  dedup Streamlit's re-delivery of old selections — keep them.
+- The "use best cell" button still routes through `_pending_inspect` +
+  `full_rerun()`: it can fire during a full run (after the inspector
+  widgets are instantiated), so a direct write would raise. Leave it.
+- Heavy per-rerun work is cached — `export_csv` (sidebar CSV bytes),
+  `top_sites`, `storm_stats`, `rp_level_map`, and the two Energy figure
+  builders. If you add a table/CSV/figure that's rebuilt from the big
+  frames, wrap it in `st.cache_data` the same way.
 
 ---
 

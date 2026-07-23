@@ -1,9 +1,8 @@
-# Irish Wave-Energy Resource Explorer — Tier 1 dependencies
-# Tested on Python 3.10–3.13. Mirrors the shannon-tidal-explorer pins.
+# Irish Wave-Energy Resource Explorer — dependencies
+# Tested on Python 3.10–3.13.
 
-streamlit>=1.30
+streamlit>=1.35                # >=1.35 for native st.plotly_chart(on_select=...) map clicks
 plotly>=5.18,<6                # Plotly 6 changed JSON schema; older Streamlit can't render it
 pandas>=2.0
 numpy>=1.26
 pyarrow>=14.0                  # parquet reader
-streamlit-plotly-events>=0.0.6 # optional — enables click-to-inspect on the map
