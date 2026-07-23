@@ -118,7 +118,23 @@ def load_extremes(domain):
 
 
 @st.cache_data(show_spinner=False)
+def storm_meta(label):
+    """TINY storm metadata WITHOUT loading the 47 MB frame arrays —
+    np.load on an .npz is lazy (members decompress on access), so
+    reading peak/hours/month/year/source costs a few KB. This is what
+    lets the Storm tab paint its KPIs instantly on first load."""
+    z = np.load(os.path.join(DATA_DIR, f"storm_{label}.npz"),
+                allow_pickle=True)
+    hours = np.asarray(z["hours"]).astype(int)
+    return dict(peak=int(z["peak"]), hours=hours,
+                month=int(z["month"]), year=int(z["year"]),
+                source=str(z["source"]), n_frames=len(hours))
+
+
+@st.cache_data(show_spinner=False)
 def storm_stats(label):
+    """(overall max Hs, colour-scale ceil). Touches the big `hs` array —
+    call ONLY when the player or hour viewer is enabled."""
     hs = load_storm(label)["hs"]
     peak_hs = float(np.nanmax(hs))
     return peak_hs, float(np.ceil(peak_hs))
@@ -525,30 +541,24 @@ def render_atlas():
 # ==========================================================================
 @fragment
 def render_storm():
+    """First paint is LIGHT: KPIs come from storm_meta() (lazy npz member
+    reads, a few KB) and NOTHING heavy builds until the player or the
+    hour viewer is ticked. Streamlit runs st.expander contents even when
+    collapsed — that's why the hour viewer is gated by a CHECKBOX, not an
+    expander; the old collapsed-expander version shipped a full-res 61k-pt
+    figure on every render of an unopened tab."""
     storm_choice = st.radio("Storm:", list(STORMS.keys()),
                             horizontal=True, key="storm_label")
     label = STORMS[storm_choice]
-    S = load_storm(label)
-    hs_all = S["hs"]
-    n_frames = hs_all.shape[0]
-    peak = int(S["peak"])
-    hours = S["hours"].astype(int)
-    mon = {12: "Dec", 1: "Jan"}.get(int(S["month"]), str(int(S["month"])))
-    syear = int(S["year"])
+    meta = storm_meta(label)
+    n_frames = meta["n_frames"]
+    peak = meta["peak"]
+    hours = meta["hours"]
+    mon = {12: "Dec", 1: "Jan"}.get(meta["month"], str(meta["month"]))
+    syear = meta["year"]
 
     def _stamp(t):
         return f"{hours[t] // 24 + 1} {mon} {syear}, {hours[t] % 24:02d}:00"
-
-    peak_hs, hs_ceil = storm_stats(label)
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Peak Hs", f"{peak_hs:.1f} m",
-              help="Largest Hs anywhere in the domain during the window.")
-    k2.metric("Peak hour", _stamp(peak))
-    k3.metric("Window", "144 h (6 days)",
-              help="Hourly frames centred on the storm peak.")
-    k4.metric("Grid", "All-Ireland (CI)",
-              help="Storm replay always uses the CI grid, independent of "
-                   "the sidebar domain toggle.")
 
     st.subheader(f"Storm replay — hourly Hs, {storm_choice}")
     show_player = st.checkbox(
@@ -557,23 +567,51 @@ def render_storm():
         help="Builds the in-browser animation (~10 MB). Once loaded it "
              "stays on for the session; untick to lighten the app again.",
     )
+    show_viewer = st.checkbox(
+        "🔎 Show the hour viewer (+ direction arrows)",
+        value=False, key=f"storm_viewer_{label}",
+        help="Single-hour map with a scrub slider and wave-direction "
+             "arrows. Loads the storm frames on first use.",
+    )
+    loaded = show_player or show_viewer
+
+    # KPIs — metadata is free; the Peak-Hs number needs the frame stack,
+    # so it appears once the player or viewer has loaded the storm.
+    k1, k2, k3, k4 = st.columns(4)
+    if loaded:
+        peak_hs, hs_ceil = storm_stats(label)
+        k1.metric("Peak Hs", f"{peak_hs:.1f} m",
+                  help="Largest Hs anywhere in the domain during the "
+                       "window.")
+    else:
+        k1.metric("Peak Hs", "—",
+                  help="Tick the player or the hour viewer to load the "
+                       "storm frames (47 MB) and show this.")
+    k2.metric("Peak hour", _stamp(peak))
+    k3.metric("Window", f"{n_frames} h (6 days)",
+              help="Hourly frames centred on the storm peak.")
+    k4.metric("Grid", "All-Ireland (CI)",
+              help="Storm replay always uses the CI grid, independent of "
+                   "the sidebar domain toggle.")
+
     if show_player:
         st.plotly_chart(storm_figure(label), use_container_width=True,
                         config=PLOTLY_CONFIG)
         st.caption(
             "▶ Play sweeps one frame per hour; the slider scrubs (ticks "
             "mark midnights). Starts on the peak frame; fixed colour "
-            "scale so the storm visibly builds and fades. Animation is "
-            "thinned 2× — the viewer below is full resolution."
+            "scale so the storm visibly builds and fades. Maps are "
+            "thinned 2× for speed."
         )
-    else:
+    if not loaded:
         st.caption(
-            "Tick the box to load the frame-by-frame player. The "
-            "full-resolution single-hour viewer below works either way."
+            "Tick a box above to load the storm — nothing heavy is "
+            "built until you do."
         )
 
-    with st.expander("🔎 Full-resolution hour viewer (+ direction arrows)",
-                     expanded=False):
+    if show_viewer:
+        S = load_storm(label)
+        hs_all = S["hs"]
         t = st.slider("Hour of window", 0, n_frames - 1, peak,
                       key=f"storm_hour_{label}")
         show_arrows = st.checkbox("Wave-direction arrows", value=True,
@@ -581,18 +619,21 @@ def render_storm():
         SXp = S["Xp"].astype(float)
         SYp = S["Yp"].astype(float)
         hs_t = hs_all[t]
-        vmax = hs_ceil
+        _, vmax = storm_stats(label)
 
+        # Display stride 2 (like the player) — full CI resolution isn't
+        # needed for the picture; ~61k pts -> ~15.5k.
+        _vs = 2
         sfig = go.Figure()
         sfig.add_trace(go.Heatmap(
-            z=np.where(np.isnan(hs_t), 1.0, np.nan),
-            x=SXp[0, :], y=SYp[:, 0],
+            z=np.where(np.isnan(hs_t), 1.0, np.nan)[::_vs, ::_vs],
+            x=SXp[0, ::_vs], y=SYp[::_vs, 0],
             colorscale=[[0.0, LAND_COLOR], [1.0, LAND_COLOR]],
             showscale=False, hoverinfo="skip", zmin=0, zmax=1,
             zsmooth=False,
         ))
         sfig.add_trace(go.Heatmap(
-            z=hs_t, x=SXp[0, :], y=SYp[:, 0],
+            z=hs_t[::_vs, ::_vs], x=SXp[0, ::_vs], y=SYp[::_vs, 0],
             colorscale="Turbo", zmin=0.0, zmax=vmax,
             hoverongaps=False, connectgaps=False, zsmooth=False,
             colorbar=standard_colorbar(),
@@ -622,8 +663,9 @@ def render_storm():
         st.plotly_chart(sfig, use_container_width=True, config=PLOTLY_CONFIG)
         st.caption(
             "Arrows point in the direction of wave travel (met-convention "
-            "'coming-from' + 180°), thinned to every 10th cell. Source: "
-            f"`{str(S['source'])}`."
+            "'coming-from' + 180°), thinned to every 10th cell. Display "
+            "thinned 2×; hover reads the strided cells. Source: "
+            f"`{meta['source']}`."
         )
 
 

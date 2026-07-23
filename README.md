@@ -195,9 +195,12 @@ All data files are < 100 MB, so plain Git is fine (no LFS needed).
   heatmaps; CI full-res) and the distribution strip is pre-binned
   server-side. KPIs, the inspector and CSV exports always use the full
   grids — only what goes into `go.Heatmap` is thinned.
-- The storm player is **opt-in by checkbox**: an always-on 144-frame
-  figure would re-ship ~10 MB whenever its fragment redraws. Don't remove
-  the gate.
+- The storm player AND the hour viewer are **opt-in by checkbox** —
+  never a collapsed `st.expander`, whose contents Streamlit still
+  executes and ships on every render. Storm KPIs come from
+  `storm_meta()` (lazy npz member reads); `load_storm()`/`storm_stats()`
+  (47 MB) run only when a checkbox is ticked. The viewer's heatmaps are
+  display-strided 2×. Don't "simplify" any of this back.
 - The animation figures are built inside `st.cache_resource` functions —
   frame stacks are rounded to 1–2 decimals (float64) before plotting to
   keep the JSON payload compact. Keep that rounding.
