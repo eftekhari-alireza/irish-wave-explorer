@@ -256,7 +256,9 @@
           6.8
         ]
       ],
-      "source_page": 14
+      "source_page": 14,
+      "depth_min_m": 20,
+      "depth_max_m": 60
     },
     {
       "name": "AquaBuoy",
@@ -450,7 +452,9 @@
           92.0
         ]
       ],
-      "source_page": 11
+      "source_page": 11,
+      "depth_min_m": 50,
+      "depth_max_m": 100
     },
     {
       "name": "CETO",
@@ -657,7 +661,9 @@
           53.0
         ]
       ],
-      "source_page": 13
+      "source_page": 13,
+      "depth_min_m": 25,
+      "depth_max_m": 50
     },
     {
       "name": "Oyster",
@@ -819,7 +825,9 @@
           277.0
         ]
       ],
-      "source_page": 14
+      "source_page": 14,
+      "depth_min_m": 10,
+      "depth_max_m": 15
     },
     {
       "name": "PWEC",
@@ -930,7 +938,9 @@
           353.6
         ]
       ],
-      "source_page": 16
+      "source_page": 16,
+      "depth_min_m": 30,
+      "depth_max_m": 80
     },
     {
       "name": "Oceantec",
@@ -1124,7 +1134,9 @@
           33.0
         ]
       ],
-      "source_page": 16
+      "source_page": 16,
+      "depth_min_m": 50,
+      "depth_max_m": 100
     },
     {
       "name": "WaveStar",
@@ -1244,7 +1256,9 @@
           340.0
         ]
       ],
-      "source_page": 16
+      "source_page": 16,
+      "depth_min_m": 6,
+      "depth_max_m": 20
     },
     {
       "name": "CorPower",
@@ -1477,7 +1491,9 @@
           400.0
         ]
       ],
-      "source_page": 11
+      "source_page": 11,
+      "depth_min_m": 40,
+      "depth_max_m": 100
     },
     {
       "name": "Pelamis",
@@ -1831,7 +1847,9 @@
           690.0
         ]
       ],
-      "source_page": 16
+      "source_page": 16,
+      "depth_min_m": 50,
+      "depth_max_m": 100
     },
     {
       "name": "WaveBob",
@@ -2067,7 +2085,9 @@
           472.0
         ]
       ],
-      "source_page": 17
+      "source_page": 17,
+      "depth_min_m": 40,
+      "depth_max_m": 100
     },
     {
       "name": "Langlee",
@@ -2303,7 +2323,9 @@
           146.0
         ]
       ],
-      "source_page": 13
+      "source_page": 13,
+      "depth_min_m": 25,
+      "depth_max_m": 60
     },
     {
       "name": "Bottom Fixed Heave Buoy",
@@ -2525,7 +2547,9 @@
           1313.0
         ]
       ],
-      "source_page": 15
+      "source_page": 15,
+      "depth_min_m": 10,
+      "depth_max_m": 40
     },
     {
       "name": "AWS",
@@ -2873,7 +2897,9 @@
           2434.0
         ]
       ],
-      "source_page": 12
+      "source_page": 12,
+      "depth_min_m": 40,
+      "depth_max_m": 100
     },
     {
       "name": "OEBuoy",
@@ -3109,7 +3135,9 @@
           1450.0
         ]
       ],
-      "source_page": 12
+      "source_page": 12,
+      "depth_min_m": 50,
+      "depth_max_m": 100
     },
     {
       "name": "Oyster 2",
@@ -3345,7 +3373,9 @@
           2658.0
         ]
       ],
-      "source_page": 14
+      "source_page": 14,
+      "depth_min_m": 10,
+      "depth_max_m": 20
     },
     {
       "name": "Pontoon",
@@ -3581,7 +3611,9 @@
           363.0
         ]
       ],
-      "source_page": 13
+      "source_page": 13,
+      "depth_min_m": 50,
+      "depth_max_m": 100
     },
     {
       "name": "WaveDragon",
@@ -3733,7 +3765,9 @@
           5740.0
         ]
       ],
-      "source_page": 17
+      "source_page": 17,
+      "depth_min_m": 20,
+      "depth_max_m": 50
     },
     {
       "name": "SSG",
@@ -4030,7 +4064,10 @@
           20000.0
         ]
       ],
-      "source_page": 15
+      "source_page": 15,
+      "depth_min_m": 0,
+      "depth_max_m": 15
     }
-  ]
+  ],
+  "depth_band_note": "Indicative WEC operating-depth bands (depth_min_m/depth_max_m, positive water depth in metres) for the placement/deployability filter. Assigned from each device's working principle and known deployments; tunable."
 }

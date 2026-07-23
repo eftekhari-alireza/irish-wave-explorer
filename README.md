@@ -5,7 +5,7 @@ on Community Cloud — see `FABLE_SPLIT`):
 
 | Entry file | App | Loads |
 |---|---|---|
-| `energy_app.py` | ⚡ Energy Resource — AEP/CF maps, best-device, compare, Devices, Site Tools; carries the map click | resource parquets, devices.json, depth_GB |
+| `energy_app.py` | ⚡ Energy Resource — AEP/CF maps, **Device placement** (map masked to each device's operating-depth band, both domains), best-device, compare, Devices, Site Tools; carries the map click | resource parquets, devices.json, depth_GB + depth_CI |
 | `atlas_app.py` | 🌍 Climate Atlas — means/seasonal/interannual/operability, storm hour-viewer, Wave Rose, Extremes. **VIEW-ONLY: no plotly_events / clickable maps** (they caused a rerun loop here); per-cell views use typed (i, j) pickers, and the Extremes map hover shows each cell's (i, j) | atlas/storm/rose/extremes npz only |
 
 Shared: `common.py` (constants, grid geometry from the tiny grid npz —

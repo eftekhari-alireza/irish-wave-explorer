@@ -52,7 +52,8 @@ METHODS = {
     "interp (bilinear)":        "interp",
     "bin (occurrence table)":   "bin",
 }
-MODES = ["Single device", "Best device per cell", "Compare two devices"]
+MODES = ["Single device", "Device placement", "Best device per cell",
+         "Compare two devices"]
 
 SHORT_NAME = {
     "Bottom Fixed Heave Buoy": "Heave Buoy",
@@ -67,28 +68,16 @@ PALETTE_18 = [
 HOMES_MWH_YR = 4.2      # average Irish household electricity use (SEAI)
 FARM_SIZES = [1, 5, 10, 25, 50, 100]
 
-# First-pass operating-depth bands (m) — heuristic from the device class;
-# confirm against the source paper before siting decisions.
-DEPTH_BANDS = {
-    "SSG":                     (0, 15),
-    "Oyster":                  (5, 20),
-    "Oyster 2":                (5, 20),
-    "WaveStar":                (5, 20),
-    "Bottom Fixed Heave Buoy": (10, 50),
-    "SeaBased AB":             (20, 60),
-    "CETO":                    (20, 60),
-    "WaveDragon":              (20, 100),
-    "Langlee":                 (30, 100),
-    "PWEC":                    (30, 100),
-    "Pontoon":                 (30, 150),
-    "AWS":                     (40, 100),
-    "CorPower":                (40, 100),
-    "Pelamis":                 (50, 150),
-    "WaveBob":                 (50, 150),
-    "AquaBuoy":                (50, 150),
-    "OEBuoy":                  (50, 150),
-    "Oceantec":                (50, 150),
-}
+# Operating-depth bands come from devices.json (`depth_min_m` /
+# `depth_max_m` per device) — the device library is the single source of
+# truth; the old hard-coded heuristic dict is gone.
+OUT_OF_BAND_COLOR = "#dfdfdf"   # wet-but-not-deployable grey (placement map)
+
+
+def device_band(name):
+    """(min, max) operating depth in metres, from the device library."""
+    d = DEVICES[name]
+    return float(d["depth_min_m"]), float(d["depth_max_m"])
 
 # --------------------------------------------------------------------------
 # DATA LOADING (energy subset only)
@@ -117,9 +106,25 @@ DEV_LIB, DEVICES, DEVICE_NAMES = load_devices()
 
 
 @st.cache_resource(show_spinner=False)
-def load_depth():
-    z = np.load(os.path.join(DATA_DIR, "depth_GB.npz"), allow_pickle=True)
+def load_depth(domain):
+    """Bathymetry (m, positive down, NaN on land), cube-aligned. GB:
+    0.5–108 m; CI: 2–4856 m from the model's ireland.bot (99.7 % of wet
+    cells carry a depth — the few missing ones are treated as
+    non-deployable)."""
+    z = np.load(os.path.join(DATA_DIR, f"depth_{domain}.npz"),
+                allow_pickle=True)
     return z["depth"].astype(np.float32)
+
+
+@st.cache_data(show_spinner=False)
+def cell_area_km2(domain):
+    """Cell area from the grid spacing at the domain's mean latitude."""
+    lon_ax, lat_ax = C.axes_1d(domain)
+    dlon = float(abs(lon_ax[1] - lon_ax[0]))
+    dlat = float(abs(lat_ax[1] - lat_ax[0]))
+    mlat = float(np.mean(lat_ax))
+    return ((dlon * 111.320 * np.cos(np.deg2rad(mlat)))
+            * (dlat * 110.574))
 
 
 @st.cache_data(show_spinner=False)
@@ -200,12 +205,11 @@ def top_sites(domain, device, method, metric, topn, d_lo, d_hi):
     sites = df_all[
         (df_all["device"] == device) & (df_all["method"] == method)
     ][["i", "j", "lon", "lat", "aep_MWh", "cf_pct"]].copy()
-    if domain == "GB":
-        dep = load_depth()
-        sites["depth_m"] = dep[sites["i"].to_numpy(), sites["j"].to_numpy()]
-        if d_lo is not None:
-            sites = sites[(sites["depth_m"] >= d_lo)
-                          & (sites["depth_m"] <= d_hi)]
+    dep = load_depth(domain)
+    sites["depth_m"] = dep[sites["i"].to_numpy(), sites["j"].to_numpy()]
+    if d_lo is not None:
+        sites = sites[(sites["depth_m"] >= d_lo)
+                      & (sites["depth_m"] <= d_hi)]
     return sites.nlargest(int(topn), metric).reset_index(drop=True)
 
 
@@ -216,7 +220,7 @@ def export_csv(domain, mode, metric_label, device, method, d_lo, d_hi):
     if mode == "Best device per cell":
         code, bval, _ = best_device_grids(domain, method, metric)
         if d_lo is not None:
-            dep = load_depth()
+            dep = load_depth(domain)
             m = np.isfinite(dep) & (dep >= d_lo) & (dep <= d_hi)
             code = np.where(m, code, np.nan)
             bval = np.where(m, bval, np.nan)
@@ -231,34 +235,83 @@ def export_csv(domain, mode, metric_label, device, method, d_lo, d_hi):
             f"best_{metric}": bval[valid],
             "method": method,
         })
-        if domain == "GB":
-            out["depth_m"] = load_depth()[ii_idx, jj_idx]
+        out["depth_m"] = load_depth(domain)[ii_idx, jj_idx]
         fname = f"wave_{domain}_best_device_{tag}_{method}.csv"
     else:
+        # Single-device rows — also the "Device placement" export, where
+        # d_lo/d_hi arrive as the device's operating band.
         df_all = load_resource(domain)
         out = df_all[
             (df_all["device"] == device) & (df_all["method"] == method)
         ][["i", "j", "lon", "lat", "device", "rated_kW", "period_type",
            "method", "aep_MWh", "cf_pct"]].copy()
-        if domain == "GB":
-            dep = load_depth()
-            out["depth_m"] = dep[out["i"].to_numpy(), out["j"].to_numpy()]
-            if d_lo is not None:
-                out = out[(out["depth_m"] >= d_lo)
-                          & (out["depth_m"] <= d_hi)]
+        dep = load_depth(domain)
+        out["depth_m"] = dep[out["i"].to_numpy(), out["j"].to_numpy()]
+        if d_lo is not None:
+            out = out[(out["depth_m"] >= d_lo)
+                      & (out["depth_m"] <= d_hi)]
         fname = f"wave_{domain}_{device.replace(' ', '_')}_{method}.csv"
     return out.to_csv(index=False).encode("utf-8"), len(out), fname
 
 
 # --------------------------------------------------------------------------
-# CACHED FIGURE BUILDERS (the two clickable Energy maps, cstride'd)
+# CACHED FIGURE BUILDERS (the clickable Energy maps, cstride'd)
 # --------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def placement_fig(domain, metric_label, device, method, b_lo, b_hi):
+    """DEVICE PLACEMENT map: the device's metric only where its
+    operating-depth band allows deployment; wet-but-out-of-band cells
+    grey out (with depth in their hover); land stays land-gray."""
+    metric, tag, cmap, hover_fmt = METRICS[metric_label]
+    g = resource_grid(domain, device, method, metric)
+    dep = load_depth(domain)
+    band = np.isfinite(dep) & (dep >= b_lo) & (dep <= b_hi)
+    gp = np.where(band, g, np.nan)
+    outband = np.isfinite(g) & ~band          # wet, but not deployable
+
+    sr, sc = cstride(domain)
+    lon_ax, lat_ax = C.axes_1d(domain)
+    dep_s = np.round(dep, 0)[::sr, ::sc]
+    fig = base_fig(stride=(sr, sc))
+    # Layer 2 — out-of-band grey (hover explains + still clickable)
+    fig.add_trace(go.Heatmap(
+        z=np.where(outband, 1.0, np.nan)[::sr, ::sc],
+        x=lon_ax[::sc], y=lat_ax[::sr],
+        colorscale=[[0.0, OUT_OF_BAND_COLOR], [1.0, OUT_OF_BAND_COLOR]],
+        showscale=False, zmin=0, zmax=1, zsmooth=False,
+        hoverongaps=False, connectgaps=False,
+        customdata=dep_s,
+        hovertemplate=("%{x:.3f}°, %{y:.3f}°<br>"
+                       "Out of band — depth %{customdata:.0f} m"
+                       "<extra></extra>"),
+    ))
+    # Layer 3 — the deployable zone, shaded by the metric
+    fig.add_trace(go.Heatmap(
+        z=gp[::sr, ::sc], x=lon_ax[::sc], y=lat_ax[::sr],
+        colorscale=cmap,
+        zmin=(float(np.nanmin(gp)) if np.isfinite(gp).any() else 0.0),
+        zmax=(float(np.nanmax(gp)) if np.isfinite(gp).any() else 1.0),
+        hoverongaps=False, connectgaps=False, zsmooth=False,
+        customdata=dep_s,
+        colorbar=standard_colorbar(),
+        hovertemplate=(
+            "%{x:.3f}°, %{y:.3f}° · depth %{customdata:.0f} m<br>"
+            f"{tag}: %{{z{hover_fmt}}}"
+            + (" %" if metric == "cf_pct" else " MWh/yr")
+            + "<extra></extra>"
+        ),
+    ))
+    add_gb_box(fig)
+    return fig
+
+
+
 @st.cache_data(show_spinner=False)
 def single_device_fig(domain, metric_label, device, method, d_lo, d_hi):
     metric, tag, cmap, hover_fmt = METRICS[metric_label]
     g = resource_grid(domain, device, method, metric)
     if d_lo is not None:
-        dep = load_depth()
+        dep = load_depth(domain)
         g = np.where(np.isfinite(dep) & (dep >= d_lo) & (dep <= d_hi),
                      g, np.nan)
     sr, sc = cstride(domain)
@@ -286,7 +339,7 @@ def best_device_fig(domain, metric_label, method, d_lo, d_hi):
     metric, tag, _, _ = METRICS[metric_label]
     code, best_val, _ = best_device_grids(domain, method, metric)
     if d_lo is not None:
-        dep = load_depth()
+        dep = load_depth(domain)
         m = np.isfinite(dep) & (dep >= d_lo) & (dep <= d_hi)
         code = np.where(m, code, np.nan)
         best_val = np.where(m, best_val, np.nan)
@@ -343,8 +396,8 @@ METRIC_CODE = {"Capacity factor (%)": "cf", "Annual energy prod. (MWh/yr)": "aep
 CODE_METRIC = {v: k for k, v in METRIC_CODE.items()}
 METHOD_CODE = {"interp (bilinear)": "i", "bin (occurrence table)": "b"}
 CODE_METHOD = {v: k for k, v in METHOD_CODE.items()}
-MODE_CODE   = {"Single device": "single", "Best device per cell": "best",
-               "Compare two devices": "cmp"}
+MODE_CODE   = {"Single device": "single", "Device placement": "place",
+               "Best device per cell": "best", "Compare two devices": "cmp"}
 CODE_MODE   = {v: k for k, v in MODE_CODE.items()}
 
 if "device" not in st.session_state:
@@ -410,6 +463,9 @@ mode = st.sidebar.radio(
     "Map mode:", MODES, key="mode",
     help=(
         "**Single device** — AEP/CF map for the selected WEC.\n\n"
+        "**Device placement** — mask the map to the device's "
+        "operating-depth band: coloured = deployable, grey = out of "
+        "band.\n\n"
         "**Best device per cell** — colour every cell by WHICH of the 18 "
         "WECs gives the highest value there.\n\n"
         "**Compare two devices** — side-by-side maps or a difference map."
@@ -444,42 +500,52 @@ method_label = st.sidebar.radio(
 )
 METHOD = METHODS[method_label]
 
-# --- 4. depth filter (GB only) ----
+# --- 4. depth filter (both domains — depth_CI.npz + depth_GB.npz) ----
 st.sidebar.subheader("4. Depth filter")
-if domain == "GB":
-    depth_on = st.sidebar.checkbox(
-        "Mask by water depth", key="depth_on",
-        help="Restricts maps, KPIs and CSV export to cells whose depth "
-             "falls in the chosen band. GB bathymetry (0.5–108 m).",
-    )
-    if depth_on:
-        depth_mode = st.sidebar.radio("Band:",
-                                      ["Device band", "Custom range"],
-                                      key="depth_mode", horizontal=True)
-        if depth_mode == "Device band":
-            D_LO, D_HI = DEPTH_BANDS[device]
-            st.sidebar.caption(
-                f"**{device}** band: **{D_LO}–{D_HI} m** — first-pass "
-                "heuristic from the device class; confirm against the "
-                "source paper before siting decisions."
-            )
-        else:
-            D_LO, D_HI = st.sidebar.slider(
-                "Depth range (m)", min_value=0.0, max_value=110.0,
-                step=1.0, key="depth_range")
+_D_MAX = 110.0 if domain == "GB" else 300.0    # practical slider ceiling
+depth_on = st.sidebar.checkbox(
+    "Mask by water depth", key="depth_on",
+    help="Restricts maps, KPIs and CSV export to cells whose depth "
+         "falls in the chosen band. GB bathymetry 0.5–108 m; CI from "
+         "the model's ireland.bot (2–4856 m; slider capped at 300 m — "
+         "nothing deploys deeper).",
+)
+if depth_on:
+    depth_mode = st.sidebar.radio("Band:",
+                                  ["Device band", "Custom range"],
+                                  key="depth_mode", horizontal=True)
+    if depth_mode == "Device band":
+        D_LO, D_HI = device_band(device)
+        st.sidebar.caption(
+            f"**{device}** operating band: **{D_LO:g}–{D_HI:g} m** "
+            "(from the device library)."
+        )
     else:
-        depth_mode, D_LO, D_HI = None, None, None
+        # Clamp any persisted range to this domain's slider ceiling
+        # (e.g. a 250 m CI range must not crash the GB slider).
+        _dr = st.session_state.get("depth_range", (10.0, 100.0))
+        st.session_state["depth_range"] = (
+            min(float(_dr[0]), _D_MAX), min(float(_dr[1]), _D_MAX))
+        D_LO, D_HI = st.sidebar.slider(
+            "Depth range (m)", min_value=0.0, max_value=_D_MAX,
+            step=1.0, key="depth_range")
 else:
-    depth_on, depth_mode, D_LO, D_HI = False, None, None, None
-    st.sidebar.caption("Depth masking is available in the **GB** domain "
-                       "only — no all-Ireland bathymetry yet (needs GEBCO).")
+    depth_mode, D_LO, D_HI = None, None, None
 
-if depth_on and domain == "GB":
-    _depth = load_depth()
+if depth_on:
+    _depth = load_depth(domain)
     DEPTH_MASK = (np.isfinite(_depth) & (_depth >= D_LO)
                   & (_depth <= D_HI))
 else:
     DEPTH_MASK = None
+
+# Effective PLACEMENT band: the device's library band, narrowed by the
+# sidebar custom range if one is active. Used by the "Device placement"
+# mode and its CSV export.
+PLACE_LO, PLACE_HI = device_band(device)
+if DEPTH_MASK is not None and depth_mode == "Custom range":
+    PLACE_LO = max(PLACE_LO, float(D_LO))
+    PLACE_HI = min(PLACE_HI, float(D_HI))
 
 # --- 5. about ----
 st.sidebar.subheader("5. About")
@@ -545,7 +611,44 @@ def render_energy():
                   else "Wet cells")
 
     # ---------------- KPI cards ----------------
-    if mode == "Best device per cell":
+    if mode == "Device placement":
+        _dep = load_depth(domain)
+        _band = (np.isfinite(_dep) & (_dep >= PLACE_LO)
+                 & (_dep <= PLACE_HI))
+        # grid_a already carries the sidebar filter; ∩ band = placement
+        gp_ = np.where(_band, grid_a, np.nan)
+        cfp_ = np.where(_band, cf_a, np.nan)
+        aepp_ = np.where(_band, aep_a, np.nan)
+        n_dep = int(np.isfinite(gp_).sum())
+        area = n_dep * cell_area_km2(domain)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Deployable cells", f"{n_dep:,}",
+                  delta=f"{area:,.0f} km² · "
+                        f"{n_dep / max(N_WET, 1) * 100:.1f}% of wet cells",
+                  delta_color="off",
+                  help=f"Wet cells whose depth is within {device}'s "
+                       f"{PLACE_LO:g}–{PLACE_HI:g} m operating band "
+                       f"(cell ≈ {cell_area_km2(domain):.2f} km²).")
+        if n_dep:
+            _bf = int(np.nanargmax(gp_))
+            _bi, _bj = _bf // NX, _bf % NX
+            c2.metric(f"Best {METRIC_TAG} in zone",
+                      f"{float(gp_[_bi, _bj]):,.1f}"
+                      + (" %" if METRIC == "cf_pct" else " MWh/yr"),
+                      delta=fmt_loc(LON_AXIS[_bj], LAT_AXIS[_bi]),
+                      delta_color="off")
+            c3.metric("Mean CF in zone",
+                      f"{float(np.nanmean(cfp_)):.1f} %")
+            c4.metric("Total AEP potential",
+                      f"{float(np.nansum(aepp_)) / 1000:,.1f} GWh/yr",
+                      help="Sum over all deployable cells assuming ONE "
+                           "device per cell — an upper bound (no array "
+                           "spacing, no losses).")
+        else:
+            c2.metric(f"Best {METRIC_TAG} in zone", "—")
+            c3.metric("Mean CF in zone", "—")
+            c4.metric("Total AEP potential", "—")
+    elif mode == "Best device per cell":
         code_grid, best_val, wins = best_device_grids(domain, METHOD, METRIC)
         if DEPTH_MASK is not None:
             code_grid = np.where(DEPTH_MASK, code_grid, np.nan)
@@ -618,6 +721,35 @@ def render_energy():
             st.caption("The red box is the nested Galway Bay (GB) domain — "
                        "switch the Domain toggle to zoom into it at ~200 m "
                        "resolution.")
+
+    elif mode == "Device placement":
+        st.subheader(f"Where can {device} go?  —  {metric_label}  ·  "
+                     f"{DMETA['label']}")
+        if not np.isfinite(np.where(
+                (np.isfinite(load_depth(domain))
+                 & (load_depth(domain) >= PLACE_LO)
+                 & (load_depth(domain) <= PLACE_HI)),
+                grid_a, np.nan)).any():
+            st.warning(
+                f"No deployable cells: {device}'s "
+                f"{PLACE_LO:g}–{PLACE_HI:g} m band has no wet cells in "
+                f"{DMETA['label']}"
+                + (" after the sidebar depth filter" if DEPTH_MASK
+                   is not None else "") + "."
+            )
+        else:
+            fig = placement_fig(domain, metric_label, device, METHOD,
+                                PLACE_LO, PLACE_HI)
+            render_map(fig, key="map_place")
+            st.caption(
+                f"Coloured cells = deployable for **{device}** "
+                f"(operating depth **{PLACE_LO:g}–{PLACE_HI:g} m**, from "
+                "the device library), shaded by "
+                f"{metric_label.lower()}. Grey sea = wet but out of the "
+                "depth band (hover shows the depth); gray = land. "
+                "Click any cell — the inspector below reports depth and "
+                "deployability."
+            )
 
     elif mode == "Best device per cell":
         st.subheader(f"Best device per cell (by {METRIC_TAG})  ·  "
@@ -729,6 +861,9 @@ def render_energy():
     # ---------------- Histogram strip ----------------
     if mode == "Single device":
         hist_vals, hist_title = grid_a[np.isfinite(grid_a)], metric_label
+    elif mode == "Device placement":
+        hist_vals = gp_[np.isfinite(gp_)]
+        hist_title = f"{metric_label} — deployable zone"
     elif mode == "Compare two devices":
         d = grid_a - grid_b
         hist_vals, hist_title = d[np.isfinite(d)], f"Δ {METRIC_TAG} (A − B)"
@@ -787,7 +922,7 @@ def render_energy():
             )
         else:
             lon_c, lat_c = float(LON_AXIS[jj]), float(LAT_AXIS[ii])
-            ctx = st.columns(5 if domain == "GB" else 4)
+            ctx = st.columns(5)
             ctx[0].metric("Location", fmt_loc(lon_c, lat_c))
             ctx[1].metric("Grid cell", f"i={ii}, j={jj}")
             best_cf_row = tbl.loc[tbl["cf_pct"].idxmax()]
@@ -796,12 +931,35 @@ def render_energy():
                           f"{float(best_cf_row['cf_pct']):.1f} %")
             ctx[3].metric("Best AEP here",
                           f"{float(best_aep_row['aep_MWh']):,.0f} MWh/yr")
-            if domain == "GB":
-                _dv = float(load_depth()[ii, jj])
-                ctx[4].metric(
-                    "Water depth",
-                    f"{_dv:.1f} m" if np.isfinite(_dv) else "—",
-                    help="From the GB bathymetry; drives the depth filter.",
+            _dv = float(load_depth(domain)[ii, jj])
+            ctx[4].metric(
+                "Water depth",
+                f"{_dv:.1f} m" if np.isfinite(_dv) else "—",
+                help="From the domain bathymetry; drives the depth "
+                     "filter and the placement view.",
+            )
+
+            # Deployability verdict for the SELECTED device at this cell
+            _blo, _bhi = device_band(device)
+            if not np.isfinite(_dv):
+                st.caption(f"No depth data at this cell — treated as "
+                           f"non-deployable for {device}.")
+            elif _blo <= _dv <= _bhi:
+                st.success(
+                    f"✅ **Deployable for {device}** — depth {_dv:.0f} m "
+                    f"is within its {_blo:g}–{_bhi:g} m operating band."
+                )
+            elif _dv < _blo:
+                st.warning(
+                    f"🚫 **Not deployable for {device}** — too shallow: "
+                    f"{_dv:.0f} m < {_blo:g} m minimum. (Its CF/AEP "
+                    "numbers below are still shown for reference.)"
+                )
+            else:
+                st.warning(
+                    f"🚫 **Not deployable for {device}** — too deep: "
+                    f"{_dv:.0f} m > {_bhi:g} m maximum. (Its CF/AEP "
+                    "numbers below are still shown for reference.)"
                 )
 
             bs1, bs2 = st.columns(2)
@@ -1070,12 +1228,15 @@ the 12-yr series and time-averaged: **AEP** = mean power × 8766 / 1000
 (MWh/yr); **CF** = mean / rated power (%). Methods: **interp** (bilinear)
 vs **bin** (occurrence table) — they agree to ~0.1 % CF.
 
-### Depth filter & farm calculator
+### Depth, placement & farm calculator
 
-GB bathymetry (0.5–108 m, cube-aligned) drives the deployability mask;
-the per-device bands are first-pass heuristics from the device class —
-confirm before siting decisions. Farm totals scale linearly (no wake
-losses); "homes powered" divides by 4.2 MWh/yr (SEAI).
+Bathymetry is cube-aligned in both domains — GB 0.5–108 m; CI 2–4856 m
+from the model's `ireland.bot` (99.7 % of wet cells carry a depth). Each
+device's operating-depth band (`depth_min_m`–`depth_max_m`) comes from
+the device library; the **Device placement** mode masks the resource map
+to that band — coloured cells are deployable, grey sea is out of band.
+Zone totals assume one device per cell (upper bound). Farm totals scale
+linearly (no wake losses); "homes powered" divides by 4.2 MWh/yr (SEAI).
 
 ### Validation
 
@@ -1085,8 +1246,8 @@ gave CF 26.6 % vs 27.9 % here; the spatial gradient is physical
 
 ### Honest caveats
 
-Wet cells only; 100 % availability assumed; leaderboard "Total AEP" is a
-one-device-per-cell upper bound; depth bands are heuristics; no LCOE.
+Wet cells only; 100 % availability assumed; leaderboard and placement
+"Total AEP" are one-device-per-cell upper bounds; no LCOE.
 
 **Climate layers** (atlas, storm replay, wave rose, return periods) live
 in the sibling [Climate Atlas app]({C.CLIMATE_APP_URL}).
@@ -1100,10 +1261,14 @@ Dr Stephen Nash). Device matrices: Majidi et al. (2025).*
 # SIDEBAR EXPORT (6.) — cached CSV bytes
 # --------------------------------------------------------------------------
 st.sidebar.subheader("6. Export")
+if mode == "Device placement":
+    _elo, _ehi = PLACE_LO, PLACE_HI       # export the deployable zone
+elif DEPTH_MASK is not None:
+    _elo, _ehi = D_LO, D_HI
+else:
+    _elo = _ehi = None
 _csv_bytes, _n_rows, _fname = export_csv(
-    domain, mode, metric_label, device, METHOD,
-    D_LO if DEPTH_MASK is not None else None,
-    D_HI if DEPTH_MASK is not None else None,
+    domain, mode, metric_label, device, METHOD, _elo, _ehi,
 )
 st.sidebar.download_button(
     label=f"📥 Download visible cells ({_n_rows:,} rows)",
