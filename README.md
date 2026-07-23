@@ -170,9 +170,19 @@ All data files are < 100 MB, so plain Git is fine (no LFS needed).
   subheader) — a titled colorbar shifts the plot area between fields.
 - Map axes have **fixed ranges** per domain — switching devices/metrics
   never re-crops the map.
-- The storm player is **opt-in by checkbox**: Streamlit re-renders every
-  tab on each interaction, so an always-on 144-frame figure would re-ship
-  ~10 MB on every click anywhere in the app. Don't remove the gate.
+- **Every tab body is an `st.fragment`** (`render_energy()` …
+  `render_extremes()`): a widget interaction inside a tab reruns only that
+  tab, not all eight — this is the fix for the app feeling heavy. Keep new
+  tab code inside its fragment, and route any state that OTHER fragments
+  read (like the inspect cell) through `full_rerun()`, never a plain
+  fragment-scoped rerun.
+- **Static maps are display-strided** via `dstride()` (GB 2× → ~4× lighter
+  heatmaps; CI full-res) and the distribution strip is pre-binned
+  server-side. KPIs, the inspector and CSV exports always use the full
+  grids — only what goes into `go.Heatmap` is thinned.
+- The storm player is **opt-in by checkbox**: an always-on 144-frame
+  figure would re-ship ~10 MB whenever its fragment redraws. Don't remove
+  the gate.
 - The animation figures are built inside `st.cache_resource` functions —
   frame stacks are rounded to 1–2 decimals (float64) before plotting to
   keep the JSON payload compact. Keep that rounding.

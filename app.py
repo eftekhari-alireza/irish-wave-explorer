@@ -179,6 +179,34 @@ def fmt_loc(lon, lat):
     return f"{abs(lon):.2f}°{ew}, {lat:.2f}°N"
 
 
+def fragment(func):
+    """st.fragment when available (Streamlit ≥ 1.37): a widget interaction
+    inside a fragment reruns ONLY that fragment, not all eight tabs. This
+    is the profiled fix for the app feeling heavy — without it, every
+    click rebuilt every tab's figures. Falls back to a plain function on
+    older Streamlit (behaviour identical to pre-fragment, just slower)."""
+    return st.fragment(func) if hasattr(st, "fragment") else func
+
+
+def dstride(domain):
+    """DISPLAY stride for static map heatmaps: GB (309×485 = 150k cells)
+    is thinned 2× (→ ~37k points, ~4× lighter payload, visually identical
+    at map zoom); CI (61k cells) ships at full resolution. Analysis, KPIs,
+    the (i, j) inspector and CSV exports always use the FULL grids —
+    only what goes into go.Heatmap is strided."""
+    return 2 if domain == "GB" else 1
+
+
+def full_rerun():
+    """Rerun the WHOLE app, even when called from inside a fragment.
+    The inspect cell is read by several fragments (Energy, Site Tools,
+    Rose, Extremes), so any change to it must escape fragment scope."""
+    try:
+        st.rerun(scope="app")
+    except TypeError:           # older Streamlit: no scope kw, no fragments
+        st.rerun()
+
+
 # --------------------------------------------------------------------------
 # DATA LOADING
 # cache_resource (not cache_data) for the big frames — avoids a full
@@ -643,6 +671,8 @@ if "_pending_inspect" in st.session_state:
     st.session_state["inspect_i"] = max(0, min(NY - 1, int(_pi)))
     st.session_state["inspect_j"] = max(0, min(NX - 1, int(_pj)))
     st.session_state["inspect_domain"] = domain
+    st.session_state["_last_inspect"] = (st.session_state["inspect_i"],
+                                         st.session_state["inspect_j"])
 
 # Reset the inspect cell when the domain changes (grid indices differ).
 if "inspect_domain" not in st.session_state:
@@ -654,10 +684,14 @@ if "inspect_domain" not in st.session_state:
         st.session_state["inspect_i"], st.session_state["inspect_j"] = \
             default_cell(domain)
     st.session_state["inspect_domain"] = domain
+    st.session_state["_last_inspect"] = (st.session_state["inspect_i"],
+                                         st.session_state["inspect_j"])
 elif st.session_state["inspect_domain"] != domain:
     st.session_state["inspect_i"], st.session_state["inspect_j"] = \
         default_cell(domain)
     st.session_state["inspect_domain"] = domain
+    st.session_state["_last_inspect"] = (st.session_state["inspect_i"],
+                                         st.session_state["inspect_j"])
 
 # --- 2. device + mode ----
 st.sidebar.subheader("2. Device")
@@ -798,6 +832,7 @@ LAT_STRETCH = 1.0 / np.cos(np.deg2rad(float(np.nanmean(LAT_AXIS))))
 
 PLOTLY_CONFIG = {
     "displaylogo": False,
+    "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"],
     "toImageButtonOptions": {
         "format": "png",
         "filename": f"wave_{domain}_{MODE_CODE[mode]}_{METRIC_TAG}",
@@ -807,10 +842,12 @@ PLOTLY_CONFIG = {
 
 
 def base_fig():
-    """New figure with the gray land underlay + fixed geo axes."""
+    """New figure with the gray land underlay + fixed geo axes.
+    The land trace is display-strided like the data traces (GB 2×)."""
+    _s = dstride(domain)
     fig = go.Figure()
     fig.add_trace(go.Heatmap(
-        z=LAND, x=LON_AXIS, y=LAT_AXIS,
+        z=LAND[::_s, ::_s], x=LON_AXIS[::_s], y=LAT_AXIS[::_s],
         colorscale=[[0.0, LAND_COLOR], [1.0, LAND_COLOR]],
         showscale=False, hoverinfo="skip",
         zmin=0, zmax=1, zsmooth=False,
@@ -904,9 +941,10 @@ def render_map(fig, key):
                 if (new_i != st.session_state["inspect_i"]
                         or new_j != st.session_state["inspect_j"]):
                     # Queue (not direct write): this handler may run after
-                    # the inspector number_inputs are instantiated.
+                    # the inspector number_inputs are instantiated. Full
+                    # rerun: other fragments read the inspect cell.
                     st.session_state["_pending_inspect"] = (new_i, new_j)
-                    st.rerun()
+                    full_rerun()
             except (TypeError, ValueError):
                 pass
         st.caption("💡 Click any cell to load it into the Cell inspector "
@@ -915,6 +953,92 @@ def render_map(fig, key):
         st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
         st.caption("💡 Tip: `pip install streamlit-plotly-events` to enable "
                    "click-to-inspect. Use the camera button to save a PNG.")
+
+
+# --------------------------------------------------------------------------
+# CACHED FIGURE BUILDERS (perf fix #3) — the two Energy-tab maps are the
+# most frequently rebuilt figures; caching skips reconstruction when the
+# inputs (domain, device, method, metric, depth band) are unchanged.
+# cache_data (not cache_resource): callers get a fresh copy each time, so
+# render_map's inspect-marker mutation can't corrupt the cache.
+# --------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def single_device_fig(domain, metric_label, device, method, d_lo, d_hi):
+    metric, tag, cmap, hover_fmt = METRICS[metric_label]
+    g = resource_grid(domain, device, method, metric)
+    if d_lo is not None:
+        dep = load_depth()
+        g = np.where(np.isfinite(dep) & (dep >= d_lo) & (dep <= d_hi),
+                     g, np.nan)
+    s = dstride(domain)
+    fig = base_fig()
+    fig.add_trace(go.Heatmap(
+        z=g[::s, ::s], x=LON_AXIS[::s], y=LAT_AXIS[::s],
+        colorscale=cmap,
+        zmin=float(np.nanmin(g)), zmax=float(np.nanmax(g)),
+        hoverongaps=False, connectgaps=False, zsmooth=False,
+        colorbar=standard_colorbar(),
+        hovertemplate=(
+            "%{x:.3f}°, %{y:.3f}°<br>"
+            f"{tag}: %{{z{hover_fmt}}}"
+            + (" %" if metric == "cf_pct" else " MWh/yr")
+            + "<extra></extra>"
+        ),
+    ))
+    add_gb_box(fig)
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def best_device_fig(domain, metric_label, method, d_lo, d_hi):
+    metric, tag, _, _ = METRICS[metric_label]
+    code, best_val, _ = best_device_grids(domain, method, metric)
+    if d_lo is not None:
+        dep = load_depth()
+        m = np.isfinite(dep) & (dep >= d_lo) & (dep <= d_hi)
+        code = np.where(m, code, np.nan)
+        best_val = np.where(m, best_val, np.nan)
+    s = dstride(domain)
+    code_s = code[::s, ::s]
+    val_s = best_val[::s, ::s]
+
+    n = len(DEVICE_NAMES)
+    cscale = []
+    for k in range(n):
+        cscale.append([k / n, PALETTE_18[k]])
+        cscale.append([(k + 1) / n, PALETTE_18[k]])
+    name_arr = np.array(DEVICE_NAMES, dtype=object)
+    hover_names = np.full(code_s.shape, "", dtype=object)
+    valid = ~np.isnan(code_s)
+    hover_names[valid] = name_arr[code_s[valid].astype(int)]
+
+    fig = base_fig()
+    fig.add_trace(go.Heatmap(
+        z=code_s, x=LON_AXIS[::s], y=LAT_AXIS[::s],
+        colorscale=cscale,
+        zmin=-0.5, zmax=n - 0.5,
+        hoverongaps=False, connectgaps=False, zsmooth=False,
+        text=hover_names,
+        customdata=val_s.astype(np.float64),
+        colorbar=dict(
+            title=dict(text=""),
+            tickvals=list(range(n)),
+            ticktext=[SHORT_NAME.get(nm, nm) for nm in DEVICE_NAMES],
+            tickfont=dict(color="black", size=9),
+            thickness=14, len=0.98,
+            x=1.01, xanchor="left", y=0.5, yanchor="middle",
+            outlinewidth=0,
+        ),
+        hovertemplate=(
+            "%{x:.3f}°, %{y:.3f}°<br>"
+            "Best: <b>%{text}</b><br>"
+            f"{tag}: %{{customdata:,.1f}}"
+            + (" %" if metric == "cf_pct" else " MWh/yr")
+            + "<extra></extra>"
+        ),
+    ))
+    add_gb_box(fig)
+    return fig
 
 
 # --------------------------------------------------------------------------
@@ -937,8 +1061,10 @@ st.markdown(
 
 # ==========================================================================
 # TAB 1 — ENERGY RESOURCE
+# (fragment: interactions inside this tab rerun only this tab)
 # ==========================================================================
-with tab_energy:
+@fragment
+def render_energy():
 
     grid_a = resource_grid(domain, device, METHOD, METRIC)
     cf_a   = resource_grid(domain, device, METHOD, "cf_pct")
@@ -1034,21 +1160,11 @@ with tab_energy:
     # ---------------- MAP ----------------
     if mode == "Single device":
         st.subheader(f"{metric_label}  —  {device}  ·  {DMETA['label']}")
-        fig = base_fig()
-        fig.add_trace(go.Heatmap(
-            z=grid_a, x=LON_AXIS, y=LAT_AXIS,
-            colorscale=CMAP,
-            zmin=float(np.nanmin(grid_a)), zmax=float(np.nanmax(grid_a)),
-            hoverongaps=False, connectgaps=False, zsmooth=False,
-            colorbar=standard_colorbar(),
-            hovertemplate=(
-                "%{x:.3f}°, %{y:.3f}°<br>"
-                f"{METRIC_TAG}: %{{z{HOVER_FMT}}}"
-                + (" %" if METRIC == "cf_pct" else " MWh/yr")
-                + "<extra></extra>"
-            ),
-        ))
-        add_gb_box(fig)
+        fig = single_device_fig(
+            domain, metric_label, device, METHOD,
+            D_LO if DEPTH_MASK is not None else None,
+            D_HI if DEPTH_MASK is not None else None,
+        )
         render_map(fig, key="map_single")
         if domain == "CI":
             st.caption("The red box is the nested Galway Bay (GB) domain — "
@@ -1058,44 +1174,11 @@ with tab_energy:
     elif mode == "Best device per cell":
         st.subheader(f"Best device per cell (by {METRIC_TAG})  ·  "
                      f"{DMETA['label']}  ·  method = {METHOD}")
-
-        # Categorical colorscale: 18 discrete bands over code 0..17
-        n = len(DEVICE_NAMES)
-        cscale = []
-        for k in range(n):
-            cscale.append([k / n, PALETTE_18[k]])
-            cscale.append([(k + 1) / n, PALETTE_18[k]])
-        name_arr = np.array(DEVICE_NAMES, dtype=object)
-        hover_names = np.full(code_grid.shape, "", dtype=object)
-        valid = ~np.isnan(code_grid)
-        hover_names[valid] = name_arr[code_grid[valid].astype(int)]
-
-        fig = base_fig()
-        fig.add_trace(go.Heatmap(
-            z=code_grid, x=LON_AXIS, y=LAT_AXIS,
-            colorscale=cscale,
-            zmin=-0.5, zmax=n - 0.5,
-            hoverongaps=False, connectgaps=False, zsmooth=False,
-            text=hover_names,
-            customdata=best_val.astype(np.float64),
-            colorbar=dict(
-                title=dict(text=""),
-                tickvals=list(range(n)),
-                ticktext=[SHORT_NAME.get(nm, nm) for nm in DEVICE_NAMES],
-                tickfont=dict(color="black", size=9),
-                thickness=14, len=0.98,
-                x=1.01, xanchor="left", y=0.5, yanchor="middle",
-                outlinewidth=0,
-            ),
-            hovertemplate=(
-                "%{x:.3f}°, %{y:.3f}°<br>"
-                "Best: <b>%{text}</b><br>"
-                f"{METRIC_TAG}: %{{customdata:,.1f}}"
-                + (" %" if METRIC == "cf_pct" else " MWh/yr")
-                + "<extra></extra>"
-            ),
-        ))
-        add_gb_box(fig)
+        fig = best_device_fig(
+            domain, metric_label, METHOD,
+            D_LO if DEPTH_MASK is not None else None,
+            D_HI if DEPTH_MASK is not None else None,
+        )
         render_map(fig, key="map_best")
         st.caption(
             "Each cell is coloured by WHICH of the 18 WECs achieves the "
@@ -1145,6 +1228,7 @@ with tab_energy:
             if z_hi == z_lo:
                 z_hi = z_lo + 1.0
 
+            _s = dstride(domain)
             col_a, col_b = st.columns(2, gap="small")
             for col, g, lab in [(col_a, grid_a, f"{device} (A)"),
                                 (col_b, grid_b, f"{device_b} (B)")]:
@@ -1152,7 +1236,8 @@ with tab_energy:
                     st.markdown(f"**{lab}**")
                     fig = base_fig()
                     fig.add_trace(go.Heatmap(
-                        z=g, x=LON_AXIS, y=LAT_AXIS,
+                        z=g[::_s, ::_s], x=LON_AXIS[::_s],
+                        y=LAT_AXIS[::_s],
                         colorscale=CMAP, zmin=z_lo, zmax=z_hi,
                         hoverongaps=False, connectgaps=False, zsmooth=False,
                         colorbar=standard_colorbar(),
@@ -1175,9 +1260,11 @@ with tab_energy:
             abs_max = float(np.nanmax(np.abs(finite))) if finite.size else 1.0
             if abs_max == 0:
                 abs_max = 1.0
+            _s = dstride(domain)
             fig = base_fig()
             fig.add_trace(go.Heatmap(
-                z=diff_grid, x=LON_AXIS, y=LAT_AXIS,
+                z=diff_grid[::_s, ::_s], x=LON_AXIS[::_s],
+                y=LAT_AXIS[::_s],
                 colorscale="RdBu_r",
                 zmin=-abs_max, zmax=abs_max, zmid=0,
                 hoverongaps=False, connectgaps=False, zsmooth=False,
@@ -1206,11 +1293,16 @@ with tab_energy:
     else:
         hist_vals = np.array([])
     if hist_vals.size:
-        hist_fig = go.Figure(go.Histogram(
-            x=hist_vals, nbinsx=40,
+        # Pre-bin server-side: go.Histogram would ship every raw value
+        # (~78k floats on GB) to the browser; 40 bars are ~nothing.
+        _cnt, _edges = np.histogram(hist_vals, bins=40)
+        _ctr = (_edges[:-1] + _edges[1:]) / 2.0
+        hist_fig = go.Figure(go.Bar(
+            x=_ctr, y=_cnt,
+            width=float(_edges[1] - _edges[0]) * 0.95,
             marker=dict(color="#4575b4", line=dict(width=0)),
             showlegend=False,
-            hovertemplate=f"{hist_title}: %{{x}}<br>Cells: %{{y}}"
+            hovertemplate=f"{hist_title}: %{{x:.2f}}<br>Cells: %{{y}}"
                           "<extra></extra>",
         ))
         hist_fig.update_layout(
@@ -1246,6 +1338,12 @@ with tab_energy:
 
         ii = int(st.session_state["inspect_i"])
         jj = int(st.session_state["inspect_j"])
+        # Typed (i, j) changes land during a fragment-scoped rerun of this
+        # tab only — promote them to a full rerun so Site Tools / Rose /
+        # Extremes repaint with the new cell.
+        if st.session_state.get("_last_inspect") != (ii, jj):
+            st.session_state["_last_inspect"] = (ii, jj)
+            full_rerun()
         tbl = cell_table(domain, ii, jj, METHOD)
 
         if tbl.empty:
@@ -1362,9 +1460,10 @@ with tab_energy:
 
 
 # ==========================================================================
-# TAB 2 — CLIMATE ATLAS (Tier 2)
+# TAB 2 — CLIMATE ATLAS (Tier 2) (fragment)
 # ==========================================================================
-with tab_atlas:
+@fragment
+def render_atlas():
     A = load_atlas(domain)
     AX = A["Xp"].astype(float)[0, :]
     AY = A["Yp"].astype(float)[:, 0]
@@ -1377,10 +1476,11 @@ with tab_atlas:
     )
 
     def atlas_map(Z, name, cmap, unit, hover_fmt, zmin=None, zmax=None):
-        """One atlas layer on the standard base map."""
+        """One atlas layer on the standard base map (display-strided)."""
+        _s = dstride(domain)
         fig = base_fig()
         fig.add_trace(go.Heatmap(
-            z=Z, x=AX, y=AY, colorscale=cmap,
+            z=Z[::_s, ::_s], x=AX[::_s], y=AY[::_s], colorscale=cmap,
             zmin=(float(np.nanmin(Z)) if zmin is None else zmin),
             zmax=(float(np.nanmax(Z)) if zmax is None else zmax),
             hoverongaps=False, connectgaps=False, zsmooth=False,
@@ -1545,9 +1645,10 @@ with tab_atlas:
 
 
 # ==========================================================================
-# TAB 3 — STORM REPLAY (Tier 2, the hero)
+# TAB 3 — STORM REPLAY (Tier 2, the hero) (fragment)
 # ==========================================================================
-with tab_storm:
+@fragment
+def render_storm():
     storm_choice = st.radio("Storm:", list(STORMS.keys()),
                             horizontal=True, key="storm_label")
     label = STORMS[storm_choice]
@@ -1655,9 +1756,10 @@ with tab_storm:
 
 
 # ==========================================================================
-# TAB 4 — DEVICE EXPLORER (Tier 3, A1)
+# TAB 4 — DEVICE EXPLORER (Tier 3, A1) (fragment)
 # ==========================================================================
-with tab_devices:
+@fragment
+def render_devices():
     st.subheader("Device Explorer — the 18-WEC library")
     dev_x = st.selectbox("Device:", DEVICE_NAMES, format_func=_fmt_dev,
                          key="devx_device")
@@ -1724,9 +1826,10 @@ with tab_devices:
 
 
 # ==========================================================================
-# TAB 5 — SITE TOOLS (Tier 3, A2 + A3)
+# TAB 5 — SITE TOOLS (Tier 3, A2 + A3) (fragment)
 # ==========================================================================
-with tab_sites:
+@fragment
+def render_sites():
     ii_s = int(st.session_state["inspect_i"])
     jj_s = int(st.session_state["inspect_j"])
 
@@ -1746,7 +1849,7 @@ with tab_sites:
             _g = np.where(DEPTH_MASK, _g, np.nan)
         _flat = int(np.nanargmax(_g))
         st.session_state["_pending_inspect"] = (_flat // NX, _flat % NX)
-        st.rerun()
+        full_rerun()
 
     farm_tbl = cell_table(domain, ii_s, jj_s, METHOD)
     if farm_tbl.empty:
@@ -1849,9 +1952,10 @@ with tab_sites:
 
 
 # ==========================================================================
-# TAB 6 — WAVE ROSE (Tier 3, B1)
+# TAB 6 — WAVE ROSE (Tier 3, B1) (fragment)
 # ==========================================================================
-with tab_rose:
+@fragment
+def render_rose():
     if not has_rose(domain):
         st.info(
             f"`rose_{domain}.npz` is not in `data/` yet — run "
@@ -1946,9 +2050,10 @@ with tab_rose:
 
 
 # ==========================================================================
-# TAB 7 — EXTREMES / RETURN PERIOD (Tier 3, B2)
+# TAB 7 — EXTREMES / RETURN PERIOD (Tier 3, B2) (fragment)
 # ==========================================================================
-with tab_extremes:
+@fragment
+def render_extremes():
     st.warning(EXTREME_CAVEAT)
     if not has_extremes(domain):
         st.info(
@@ -1992,9 +2097,10 @@ with tab_extremes:
                        "the display cap — noisy fits, not physics.")
 
         st.subheader(f"{T_sel}-yr return-level Hs  ·  {DMETA['label']}")
+        _s = dstride(domain)
         rp_fig = base_fig()
         rp_fig.add_trace(go.Heatmap(
-            z=Z_rp, x=LON_AXIS, y=LAT_AXIS,
+            z=Z_rp[::_s, ::_s], x=LON_AXIS[::_s], y=LAT_AXIS[::_s],
             colorscale="Turbo",
             zmin=0.0, zmax=RP_CLIP_M,       # DISPLAY CLIP ONLY (per spec)
             hoverongaps=False, connectgaps=False, zsmooth=False,
@@ -2078,6 +2184,27 @@ with tab_extremes:
                     "plotting positions T = (n+1)/rank. Blue line: the "
                     "fitted Gumbel return-level curve. " + EXTREME_CAVEAT
                 )
+
+
+# ==========================================================================
+# MOUNT THE FRAGMENTS INTO THEIR TABS
+# (each fragment reruns independently; the Methodology tab below is plain
+# static markdown and stays inline)
+# ==========================================================================
+with tab_energy:
+    render_energy()
+with tab_atlas:
+    render_atlas()
+with tab_storm:
+    render_storm()
+with tab_devices:
+    render_devices()
+with tab_sites:
+    render_sites()
+with tab_rose:
+    render_rose()
+with tab_extremes:
+    render_extremes()
 
 
 # ==========================================================================
