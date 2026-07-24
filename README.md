@@ -6,7 +6,7 @@ on Community Cloud — see `FABLE_SPLIT`):
 | Entry file | App | Loads |
 |---|---|---|
 | `energy_app.py` | ⚡ Energy Resource — AEP/CF maps, **Device placement** (map masked to each device's operating-depth band, both domains), best-device, compare, Devices, Site Tools; carries the map click | resource parquets, devices.json, depth_GB + depth_CI |
-| `atlas_app.py` | 🌍 Climate Atlas — means/seasonal/interannual/operability, storm hour-viewer, Wave Rose, Extremes. **VIEW-ONLY: no plotly_events / clickable maps** (they caused a rerun loop here); per-cell views use typed (i, j) pickers, and the Extremes map hover shows each cell's (i, j) | atlas/storm/rose/extremes npz only |
+| `atlas_app.py` | 🌍 Climate Atlas — means (incl. annual energy MWh/m/yr), seasonal Hs/P/Te/Tp, monthly climatology, interannual + 12-yr trend, percentiles (P50–P99), weather-window accessibility maps (Moore, Eftekhari & Nash 2024), operability, storm frequency, extremes + variability, loops, storm hour-viewer, wave rose (occurrence⇄energy), per-cell joint Hs–Te. **VIEW-ONLY: no plotly_events / clickable maps**; per-cell views use typed (i, j) pickers | atlas/storm/rose/extremes/climate_v2 npz only (v2 loads LAZILY — the joint block is 20–48 MB) |
 
 Shared: `common.py` (constants, grid geometry from the tiny grid npz —
 wet mask = `count > 0`, verified identical to the parquet's wet cells —

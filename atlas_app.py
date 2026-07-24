@@ -63,7 +63,16 @@ ATLAS_PARAMS = {
     "Peak period Tp (s)":             ("mean_tp",  "Plasma",  "s",    ":.1f"),
     "Mean wave direction (° from)":   ("mean_dir", "Phase",   "°",    ":.0f"),
     "Wave power P (kW/m)":            ("mean_P",   "Turbo",   "kW/m", ":.1f"),
+    # derived: mean_P × 8766 h / 1000 → annual energy per metre of crest
+    "Annual wave energy (MWh/m/yr)":  ("__annual_E__", "Turbo", "MWh/m",
+                                       ":,.0f"),
 }
+
+ATLAS_VIEWS = [
+    "Long-term mean", "Seasonal", "Monthly", "Interannual", "Trend",
+    "Percentiles", "Weather windows", "Operability", "Storm frequency",
+    "Extremes", "Variability", "Animated loops",
+]
 OP_LAYERS = {
     "1.5 m": "op_below_1.5m",
     "2.0 m": "op_below_2m",
@@ -173,6 +182,86 @@ def default_cell(domain):
     Z = load_atlas(domain)["mean_hs"]
     flat = int(np.nanargmax(Z))
     return flat // Z.shape[1], flat % Z.shape[1]
+
+
+# --------------------------------------------------------------------------
+# CLIMATE V2 (climate_v2_<dom>.npz) — LAZY loaders. The npz handle is
+# cached and members decompress on access; the joint Hs–Te block alone is
+# 20–48 MB, so nothing is eagerly loaded (unlike the small atlas file).
+# --------------------------------------------------------------------------
+def has_v2(domain):
+    return os.path.exists(os.path.join(DATA_DIR, f"climate_v2_{domain}.npz"))
+
+
+@st.cache_resource(show_spinner=False)
+def _v2_file(domain):
+    return np.load(os.path.join(DATA_DIR, f"climate_v2_{domain}.npz"),
+                   allow_pickle=True)
+
+
+@st.cache_data(show_spinner=False, max_entries=48)
+def v2_map(domain, key):
+    """One (…, ny, nx) layer from the v2 file, decompressed once."""
+    return np.asarray(_v2_file(domain)[key])
+
+
+@st.cache_data(show_spinner=False)
+def v2_meta(domain):
+    z = _v2_file(domain)
+    return dict(
+        vessel_hs=[float(v) for v in z["vessel_hs"]],
+        min_dur_h=[int(v) for v in z["min_dur_h"]],
+        pct_levels=[int(v) for v in z["pct_levels"]],
+        hsj_edges=np.asarray(z["hsj_edges"], dtype=float),
+        tej_edges=np.asarray(z["tej_edges"], dtype=float),
+        dt_h=float(z["dt_h"]),
+    )
+
+
+@st.cache_resource(show_spinner="Loading joint Hs–Te histograms…")
+def v2_joint(domain):
+    """(ny, nx, nHsJ, nTeJ) int32 counts — 20–48 MB; loaded only when the
+    joint view is first used, then kept."""
+    return np.asarray(_v2_file(domain)["joint_hs_te"])
+
+
+MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+WW_CITATION = (
+    "Weather-window method follows **Moore, Eftekhari & Nash (2024)**, "
+    "\"Weather window analysis…\", *J. Ocean Eng. Mar. Energy* "
+    "10:711–729 — Hs-only analysis (their Sect. 3.2); wind is not "
+    "included. Vessel Hs limits per their Table 7."
+)
+
+
+@st.cache_data(show_spinner=False)
+def trend_map(domain):
+    """Per-cell linear trend of annual-mean Hs (2004–2015), m/decade.
+    Ordinary least squares on 12 points — indicative, not
+    significance-tested."""
+    import warnings
+    A = load_atlas(domain)
+    years = np.array([int(y) for y in A["years"]], dtype=float)
+    stack = np.stack([A[f"hs_year_{int(y)}"] for y in years])   # (12,ny,nx)
+    x = years - years.mean()
+    with warnings.catch_warnings():
+        # land columns are all-NaN -> benign "mean of empty slice"
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        ybar = np.nanmean(stack, axis=0)
+    slope_per_yr = (np.tensordot(x, stack - ybar[None], axes=(0, 0))
+                    / float((x ** 2).sum()))
+    return (slope_per_yr * 10.0).astype(np.float32)             # m/decade
+
+
+def bin_labels(edges):
+    """['0–1', …, '10+'] labels from edges whose last entry may be inf."""
+    out = []
+    for k in range(len(edges) - 1):
+        lo, hi = float(edges[k]), float(edges[k + 1])
+        out.append(f"{lo:g}+" if np.isinf(hi) else f"{lo:g}–{hi:g}")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -350,9 +439,7 @@ def render_atlas():
     AY = A["Yp"].astype(float)[:, 0]
 
     view = st.radio(
-        "Atlas view:",
-        ["Long-term mean", "Seasonal", "Interannual", "Operability",
-         "Extremes", "Variability", "Animated loops"],
+        "Atlas view:", ATLAS_VIEWS,
         horizontal=True, key="atlas_view",
     )
 
@@ -385,9 +472,17 @@ def render_atlas():
         param = st.selectbox("Parameter:", list(ATLAS_PARAMS.keys()),
                              key="atlas_param")
         key, cmap, unit, hfmt = ATLAS_PARAMS[param]
-        Z = A[key]
+        Z = (A["mean_P"] * 8.766 if key == "__annual_E__" else A[key])
         st.subheader(f"12-yr mean — {param}  ·  {DMETA['label']}")
-        if key == "mean_dir":
+        if key == "__annual_E__":
+            atlas_kpis(Z, unit, "0f")
+            atlas_map(Z, "Annual energy", cmap, unit, hfmt)
+            st.caption(
+                "Derived: mean wave power (deep-water P = 0.49·Hs²·Te, "
+                "kW/m) × 8766 h ÷ 1000 → MWh per metre of wave crest per "
+                "year."
+            )
+        elif key == "mean_dir":
             st.caption(
                 "Directions are met-convention ('coming from', ° clockwise "
                 "from north) on a cyclic colour scale. Domain statistics "
@@ -401,35 +496,241 @@ def render_atlas():
                 st.caption("Deep-water estimate P = 0.49 · Hs² · Te (kW/m).")
 
     elif view == "Seasonal":
-        sp = st.radio("Parameter:", ["Hs (m)", "Wave power (kW/m)"],
+        _sopts = ["Hs (m)", "Wave power (kW/m)"]
+        if has_v2(domain):          # seasonal periods live in climate_v2
+            _sopts += ["Te (s)", "Tp (s)"]
+        sp = st.radio("Parameter:", _sopts,
                       horizontal=True, key="atlas_sparam")
         season = st.select_slider("Season:", options=list(SEASONS.keys()),
                                   key="atlas_season")
-        prefix = "hs" if sp.startswith("Hs") else "P"
-        unit = "m" if prefix == "hs" else "kW/m"
-        skeys = ([f"mean_{'hs' if prefix == 'hs' else 'P'}"]
-                 + [f"{prefix}_{s}" for s in ("win", "spr", "smr", "aum")])
-        vmax = max(float(np.nanmax(A[k])) for k in skeys)
-        key = (skeys[0] if SEASONS[season] is None
-               else f"{prefix}_{SEASONS[season]}")
-        Z = A[key]
-        win_smr = (float(np.nanmean(A[f"{prefix}_win"]))
-                   / max(float(np.nanmean(A[f"{prefix}_smr"])), 1e-9))
+        prefix = {"H": "hs", "W": "P", "T": sp[:2].lower()}[sp[0]]
+        unit = {"hs": "m", "P": "kW/m", "te": "s", "tp": "s"}[prefix]
+
+        def _seasonal_layer(sfx):
+            """Annual (sfx None) or one season, from atlas or climate_v2."""
+            if prefix in ("hs", "P"):
+                return (A[f"mean_{prefix}"] if sfx is None
+                        else A[f"{prefix}_{sfx}"])
+            return (A[f"mean_{prefix}"] if sfx is None
+                    else v2_map(domain, f"{prefix}_{sfx}"))
+
+        vmax = max(float(np.nanmax(_seasonal_layer(s)))
+                   for s in [None, "win", "spr", "smr", "aum"])
+        Z = _seasonal_layer(SEASONS[season])
+        win_smr = (float(np.nanmean(_seasonal_layer("win")))
+                   / max(float(np.nanmean(_seasonal_layer("smr"))), 1e-9))
         k1, k2, k3 = st.columns(3)
         k1.metric(f"Domain mean — {season}",
                   f"{float(np.nanmean(Z)):,.2f} {unit}")
         k2.metric("Max", f"{float(np.nanmax(Z)):,.2f} {unit}")
         k3.metric("Winter / summer ratio", f"{win_smr:.2f}×",
                   help="Domain-mean winter (DJF) over summer (JJA) — the "
-                       "seasonal contrast of the resource.")
+                       "seasonal contrast.")
         st.subheader(f"{sp} — {season}  ·  {DMETA['label']}")
         atlas_map(Z, sp.split(" (")[0],
-                  "Viridis" if prefix == "hs" else "Turbo",
+                  ("Viridis" if prefix == "hs"
+                   else "Turbo" if prefix == "P" else "Plasma"),
                   unit, ":.2f", zmin=0.0, zmax=vmax)
         st.caption(
             "All seasons share one colour scale (fixed 0 → all-season "
             "max). Seasons: DJF / MAM / JJA / SON."
+            + (" Seasonal periods from climate_v2."
+               if prefix in ("te", "tp") else "")
         )
+
+    elif view == "Monthly":
+        if not has_v2(domain):
+            st.info(f"`climate_v2_{domain}.npz` not in `data/` yet — run "
+                    "`climate_v2.py` to enable the monthly climatology.")
+        else:
+            mon_lbl = st.select_slider("Month:", options=MONTH_NAMES,
+                                       key="atlas_month")
+            m_idx = MONTH_NAMES.index(mon_lbl)
+            monthly = v2_map(domain, "monthly_hs")
+            Z = monthly[m_idx]
+            vmax = float(np.nanmax(monthly))
+            k1, k2, k3 = st.columns(3)
+            k1.metric(f"Domain-mean Hs — {mon_lbl}",
+                      f"{float(np.nanmean(Z)):.2f} m")
+            k2.metric("Max", f"{float(np.nanmax(Z)):.2f} m")
+            _mm = [float(np.nanmean(monthly[k])) for k in range(12)]
+            k3.metric("Roughest / calmest month",
+                      f"{MONTH_NAMES[int(np.argmax(_mm))]} / "
+                      f"{MONTH_NAMES[int(np.argmin(_mm))]}")
+            st.subheader(f"Monthly-mean Hs — {mon_lbl}  ·  "
+                         f"{DMETA['label']}")
+            atlas_map(Z, "Hs", "Viridis", "m", ":.2f",
+                      zmin=0.0, zmax=vmax)
+            st.caption("12-yr climatology by calendar month, one shared "
+                       "colour scale — drag the slider through the year.")
+
+    elif view == "Trend":
+        S = trend_map(domain)
+        amax = float(np.nanmax(np.abs(S)))
+        years = [int(y) for y in A["years"]]
+        ymeans = [float(np.nanmean(A[f"hs_year_{y}"])) for y in years]
+        fit = np.polyfit(years, ymeans, 1)          # slope m/yr
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Domain-mean trend",
+                  f"{fit[0] * 10:+.3f} m/decade",
+                  help="OLS fit to the 12 domain-mean annual Hs values.")
+        k2.metric("Cells trending up",
+                  f"{float(np.nanmean((S > 0)[np.isfinite(S)])) * 100:.0f} %")
+        _sf = int(np.nanargmax(np.abs(S)))
+        k3.metric("Steepest cell trend",
+                  f"{float(S.ravel()[_sf]):+.3f} m/decade")
+        st.subheader(f"Hs trend 2004–2015  ·  {DMETA['label']}")
+        atlas_map(S, "Trend", "RdBu_r", "m/decade", ":.3f",
+                  zmin=-amax, zmax=amax)
+        tfig = go.Figure()
+        tfig.add_trace(go.Scatter(
+            x=years, y=ymeans, mode="markers+lines",
+            line=dict(color="#4575b4", width=1.5),
+            marker=dict(size=7), name="Domain-mean Hs",
+            hovertemplate="%{x}: %{y:.2f} m<extra></extra>"))
+        tfig.add_trace(go.Scatter(
+            x=years, y=np.polyval(fit, years), mode="lines",
+            line=dict(color="#d62728", dash="dash", width=2),
+            name=f"Trend {fit[0] * 10:+.3f} m/decade",
+            hoverinfo="skip"))
+        tfig.update_layout(
+            height=260, margin=dict(l=60, r=20, t=10, b=40),
+            plot_bgcolor="white", font=dict(size=10),
+            xaxis_title="Year", yaxis_title="Domain-mean Hs (m)",
+            legend=dict(font=dict(size=10)))
+        tfig.update_xaxes(showgrid=True, gridcolor="#eeeeee")
+        tfig.update_yaxes(showgrid=True, gridcolor="#eeeeee")
+        st.plotly_chart(tfig, use_container_width=True,
+                        config={"displaylogo": False})
+        st.caption(
+            "⚠️ Per-cell OLS slope of the 12 annual-mean Hs maps, in "
+            "m/decade (red = roughening, blue = calming). Twelve points "
+            "is a short record — indicative only, not "
+            "significance-tested; interannual variability (σ view) is "
+            "of comparable size."
+        )
+
+    elif view == "Percentiles":
+        if not has_v2(domain):
+            st.info(f"`climate_v2_{domain}.npz` not in `data/` yet — run "
+                    "`climate_v2.py` to enable percentile maps.")
+        else:
+            pvar = st.radio("Variable:", ["Hs (m)", "Wave power (kW/m)"],
+                            horizontal=True, key="atlas_pvar")
+            lvl = st.select_slider(
+                "Percentile:", options=v2_meta(domain)["pct_levels"],
+                value=90, key="atlas_plvl")
+            pk = ("hs" if pvar.startswith("Hs") else "P") + f"_p{lvl}"
+            unit = "m" if pvar.startswith("Hs") else "kW/m"
+            Z = v2_map(domain, pk)
+            atlas_kpis(Z, unit, "1f")
+            st.subheader(f"P{lvl} {pvar}  ·  {DMETA['label']}")
+            atlas_map(Z, f"P{lvl}", "Turbo" if unit == "kW/m" else
+                      "Viridis", unit, ":.1f")
+            st.caption(
+                "Exceeded (100 − P) % of the 12-yr record. **P90 wave "
+                "power is the headline resource-assessment metric.** "
+                "Computed from per-cell histograms "
+                "(0.1 m / 20 kW/m bins)."
+            )
+
+    elif view == "Weather windows":
+        if not has_v2(domain):
+            st.info(f"`climate_v2_{domain}.npz` not in `data/` yet — run "
+                    "`climate_v2.py` to enable accessibility maps.")
+        else:
+            M = v2_meta(domain)
+            wc1, wc2, wc3 = st.columns(3)
+            with wc1:
+                v_hs = st.selectbox(
+                    "Vessel limit (max operating Hs):",
+                    M["vessel_hs"], index=1,
+                    format_func=lambda v: f"Hs ≤ {v:g} m",
+                    key="ww_vessel")
+            with wc2:
+                dur = st.selectbox("Minimum window duration:",
+                                   M["min_dur_h"], index=2,
+                                   format_func=lambda d: f"{d} h",
+                                   key="ww_dur")
+            with wc3:
+                wmap = st.selectbox(
+                    "Map:",
+                    ["Persistence (%)", "Windows per year",
+                     "Mean window (h)", "Max window (h)",
+                     "Mean wait (h)"],
+                    key="ww_map")
+            vi = M["vessel_hs"].index(v_hs)
+            di = M["min_dur_h"].index(dur)
+
+            if wmap == "Persistence (%)":
+                Z = v2_map(domain, "persistence_pct")[vi, di]
+                atlas_kpis(Z, "%", "1f")
+                st.subheader(
+                    f"Accessibility — % of time inside ≥{dur} h windows "
+                    f"with Hs ≤ {v_hs:g} m  ·  {DMETA['label']}")
+                atlas_map(Z, "Persistence", "RdYlGn", "%", ":.1f",
+                          zmin=0.0, zmax=100.0)
+            elif wmap == "Windows per year":
+                Z = v2_map(domain, "windows_per_yr")[vi, di]
+                atlas_kpis(Z, "/yr", "1f")
+                st.subheader(
+                    f"Qualifying windows per year (≥{dur} h, "
+                    f"Hs ≤ {v_hs:g} m)  ·  {DMETA['label']}")
+                atlas_map(Z, "Windows", "Viridis", "/yr", ":.1f")
+            else:
+                wkey = {"Mean window (h)": "mean_window_h",
+                        "Max window (h)": "max_window_h",
+                        "Mean wait (h)": "mean_wait_h"}[wmap]
+                Z = v2_map(domain, wkey)[vi]
+                # sheltered cells where Hs never exceeds the limit have
+                # window = the whole record — clip the COLOUR scale to
+                # the 95th percentile so the map stays readable (hover
+                # shows true values)
+                _fin = Z[np.isfinite(Z)]
+                _cap = float(np.nanpercentile(_fin, 95)) if _fin.size else 1.0
+                atlas_kpis(Z, "h", "0f")
+                st.subheader(f"{wmap} for Hs ≤ {v_hs:g} m  ·  "
+                             f"{DMETA['label']}")
+                atlas_map(Z, wmap.split(" (")[0],
+                          "RdYlGn_r" if "wait" in wkey else "Viridis",
+                          "h", ":,.0f", zmin=0.0, zmax=_cap)
+                st.caption(f"Colour scale capped at the 95th percentile "
+                           f"({_cap:,.0f} h) — fully-sheltered cells' "
+                           "windows span the whole record.")
+            st.caption(
+                WW_CITATION + " Persistence % = share of the record "
+                "spent inside continuous Hs-below-limit runs of at "
+                "least the chosen duration."
+            )
+
+    elif view == "Storm frequency":
+        if not has_v2(domain):
+            st.info(f"`climate_v2_{domain}.npz` not in `data/` yet — run "
+                    "`climate_v2.py` to enable storm-frequency maps.")
+        else:
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                thr = st.radio("Storm threshold:", ["Hs > 4 m", "Hs > 6 m"],
+                               horizontal=True, key="storm_thr")
+            with sc2:
+                smet = st.radio("Metric:", ["Events per year",
+                                            "Hours per year"],
+                                horizontal=True, key="storm_met")
+            tval = "4.0" if "4" in thr else "6.0"
+            skey = (f"storm{tval}_evt_per_yr" if smet.startswith("Events")
+                    else f"storm{tval}_hrs_per_yr")
+            unit = "/yr" if smet.startswith("Events") else "h/yr"
+            Z = v2_map(domain, skey)
+            atlas_kpis(Z, unit, "1f")
+            st.subheader(f"Storm frequency — {smet.lower()} with {thr}  ·  "
+                         f"{DMETA['label']}")
+            atlas_map(Z, "Storms", "Turbo", unit,
+                      ":.1f" if smet.startswith("Events") else ":,.0f")
+            st.caption(
+                "A storm event = a continuous run of Hs above the "
+                "threshold; hours = total time above it, per year of "
+                "the 12-yr record."
+            )
 
     elif view == "Interannual":
         years = [int(y) for y in A["years"]]
@@ -655,13 +956,24 @@ def render_rose():
     centers = R["dir_centers"].astype(float)
     band_labels = hs_band_labels(edges)
 
-    scope = st.radio(
-        "Rose for:", ["Domain-wide", "Inspected cell"],
-        horizontal=True, key="rose_scope",
-        help="Domain-wide = all wet cells pooled. Inspected cell = the "
-             "typed (i, j) below — read a cell's (i, j) off the Extremes "
-             "map hover, or use the clickable maps in the Energy app.",
-    )
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        scope = st.radio(
+            "Rose for:", ["Domain-wide", "Inspected cell"],
+            horizontal=True, key="rose_scope",
+            help="Domain-wide = all wet cells pooled. Inspected cell = "
+                 "the typed (i, j) below — read a cell's (i, j) off the "
+                 "Extremes map hover, or use the clickable maps in the "
+                 "Energy app.",
+        )
+    with rc2:
+        weighting = st.radio(
+            "Weight by:", ["Occurrence", "Energy proxy (Hs²)"],
+            horizontal=True, key="rose_weight",
+            help="Occurrence = plain % of the record. Energy proxy = "
+                 "each Hs band weighted by its band-centre Hs² — where "
+                 "the ENERGY comes from, not just how often waves come.",
+        )
 
     hist = None
     if scope == "Inspected cell":
@@ -690,18 +1002,28 @@ def render_rose():
             st.caption(f"All {N_WET:,} wet cells pooled "
                        f"({int(R['n_steps']):,} timesteps each).")
 
+    energy_mode = weighting.startswith("Energy")
+    if energy_mode:
+        # Band-centre Hs² weight; the open 6+ band uses 6.5 m.
+        _ctr = np.array([
+            (float(edges[k]) + (float(edges[k + 1])
+                                if np.isfinite(edges[k + 1])
+                                else float(edges[k]) + 1.0)) / 2.0
+            for k in range(len(band_labels))])
+        hist = hist * (_ctr[:, None] ** 2)
     pct = hist / max(float(hist.sum()), 1.0) * 100.0
 
     dom_k = int(np.argmax(pct.sum(axis=0)))
     rough = float(pct[[k for k in range(len(band_labels))
                        if float(edges[k]) >= 4.0], :].sum())
+    _what = "energy" if energy_mode else "time"
     r1, r2, r3 = st.columns(3)
-    r1.metric("Dominant direction", f"{centers[dom_k]:.0f}°",
-              help="Sector with the most occurrences — met convention, "
-                   "'coming from', ° clockwise from north.")
-    r2.metric("Time in dominant sector",
+    r1.metric(f"Dominant direction (by {_what})", f"{centers[dom_k]:.0f}°",
+              help="Met convention — 'coming from', ° clockwise from "
+                   "north.")
+    r2.metric(f"{_what.capitalize()} in dominant sector",
               f"{float(pct[:, dom_k].sum()):.1f} %")
-    r3.metric("Time with Hs ≥ 4 m", f"{rough:.1f} %",
+    r3.metric(f"{_what.capitalize()} from Hs ≥ 4 m", f"{rough:.1f} %",
               help="Sum of the 4–5, 5–6 and 6+ m bands.")
 
     rose_fig = go.Figure()
@@ -731,12 +1053,70 @@ def render_rose():
     st.plotly_chart(rose_fig, use_container_width=True,
                     config=PLOTLY_CONFIG)
     st.caption(
-        "Joint Hs × direction occurrence from the full 12-yr hindcast "
-        "(plain counting — no fitting). Directions are met-convention "
+        "Joint Hs × direction from the full 12-yr hindcast (plain "
+        "counting — no fitting). Directions are met-convention "
         "**'coming from'** (N at top): the dominant westerly sector is "
         "Atlantic swell. 12 sectors × 7 Hs bands; radial axis = % of "
-        "the record."
+        + ("the record's Hs²-weighted ENERGY PROXY. True wave power "
+           "also scales with period (not stored per sector) — treat as "
+           "indicative; the open 6+ m band uses a 6.5 m centre."
+           if energy_mode else "the record.")
     )
+
+    # ---------------- Joint Hs–Te at the inspected cell (climate_v2) ----
+    if has_v2(domain):
+        st.markdown("---")
+        st.subheader("Joint Hs–Te at the inspected cell")
+        if scope != "Inspected cell":
+            st.caption("Switch 'Rose for' to **Inspected cell** and pick "
+                       "(i, j) above to see that cell's joint Hs–Te "
+                       "occurrence (the sea-state table a device's power "
+                       "matrix is evaluated on).")
+        else:
+            ii_j = int(st.session_state["inspect_i"])
+            jj_j = int(st.session_state["inspect_j"])
+            M = v2_meta(domain)
+            jnt = v2_joint(domain)[ii_j, jj_j].astype(float)  # (nHsJ,nTeJ)
+            tot = float(jnt.sum())
+            if tot <= 0:
+                st.warning(f"(i={ii_j}, j={jj_j}) has no joint-histogram "
+                           "data (land cell).")
+            else:
+                jp = jnt / tot * 100.0
+                hs_lbl = bin_labels(M["hsj_edges"])
+                te_lbl = bin_labels(M["tej_edges"])
+                _mk = np.unravel_index(int(np.argmax(jp)), jp.shape)
+                j1, j2 = st.columns(2)
+                j1.metric("Modal sea state",
+                          f"Hs {hs_lbl[_mk[0]]} m · Te {te_lbl[_mk[1]]} s",
+                          delta=f"{float(jp[_mk]):.1f} % of record",
+                          delta_color="off")
+                j2.metric("Cell", f"i={ii_j}, j={jj_j}",
+                          delta=fmt_loc(LON_AXIS[jj_j], LAT_AXIS[ii_j]),
+                          delta_color="off")
+                jfig = go.Figure(go.Heatmap(
+                    z=jp, x=te_lbl, y=hs_lbl,
+                    colorscale="Viridis",
+                    colorbar=standard_colorbar(),
+                    hovertemplate=("Te %{x} s · Hs %{y} m<br>"
+                                   "%{z:.2f} % of record"
+                                   "<extra></extra>"),
+                ))
+                jfig.update_layout(
+                    height=380,
+                    margin=dict(l=60, r=RIGHT_MARGIN, t=10, b=45),
+                    xaxis_title="Energy period Te (s)",
+                    yaxis_title="Significant wave height Hs (m)",
+                    font=dict(size=10), plot_bgcolor="white",
+                )
+                st.plotly_chart(jfig, use_container_width=True,
+                                config=PLOTLY_CONFIG)
+                st.caption(
+                    "Occurrence % per (Hs, Te) bin over the 12-yr record "
+                    "— this is the sea-state table a WEC's power matrix "
+                    "is evaluated against (see the Energy app's Device "
+                    "Explorer for the matrices)."
+                )
 
 
 # ==========================================================================
@@ -960,6 +1340,27 @@ Gumbel (EV-I) fit to each cell's 12 annual maxima;
 Hs(T) = loc − scale·ln(−ln(1 − 1/T)). {EXTREME_CAVEAT} The map's colour
 scale is display-clipped at 20 m (a ~0.2 % CI tail over-extrapolates);
 stored values are untouched.
+
+### Climate v2 layers (percentiles, weather windows, monthly, joint, storms)
+
+From a one-pass reduction of the full hindcast (`climate_v2.py`):
+per-cell **percentiles** of Hs and wave power (P50/90/95/99, from 0.1 m
+/ 20 kW/m histograms — P90 power is the headline resource metric);
+**monthly climatology** of Hs; **seasonal Te/Tp**; per-cell **joint
+Hs–Te occurrence** (10 × 8 bins — the sea-state table device power
+matrices are evaluated on); and **storm frequency** (events and hours
+per year above 4 m / 6 m).
+
+**Weather windows / accessibility** follow Moore, Eftekhari & Nash
+(2024), "Weather window analysis of a Galway Bay wave-energy test-site",
+*J. Ocean Eng. Mar. Energy* 10:711–729: for each vessel operating limit
+(Hs ≤ 1.0–3.0 m, their Table 7) and minimum window duration (6–96 h),
+persistence % = the share of the record spent inside continuous
+below-limit runs of at least that duration; plus windows/yr and
+mean/max window and mean wait statistics. Hs-only analysis (their
+Sect. 3.2); wind criteria are not included. The **Trend** view is an
+OLS slope over 12 annual means — indicative only, not
+significance-tested.
 
 ### Honest caveats
 
